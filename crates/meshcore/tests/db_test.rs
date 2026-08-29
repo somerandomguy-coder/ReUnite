@@ -14,6 +14,7 @@ fn test_database_store_lifecycle() {
     assert!(db.sql_schema().contains("CREATE TABLE IF NOT EXISTS messages"));
     assert!(db.sql_schema().contains("CREATE TABLE IF NOT EXISTS networks"));
     assert!(db.sql_schema().contains("CREATE TABLE IF NOT EXISTS safe_zones"));
+    assert!(db.sql_schema().contains("CREATE TABLE IF NOT EXISTS breadcrumbs"));
     assert!(!REUNITE_SQL_SCHEMA.is_empty());
 
     // 2. Test Contact saving and reloading

@@ -83,6 +83,8 @@ class MeshService extends ChangeNotifier {
   /// No account, no sign-up, and nothing here touches the internet.
   /// [homeOverride], [port], [multicast] and [broadcast] exist so tests can start a real
   /// node without colliding with a node already running on this machine.
+  Timer? _autoGpsTimer;
+
   Future<void> init({
     List<String> peers = const [],
     String? homeOverride,
@@ -90,7 +92,7 @@ class MeshService extends ChangeNotifier {
     bool? multicast,
     bool broadcast = true,
     String? name,
-    MeshTransport transport = MeshTransport.wifi,
+    MeshTransport transport = MeshTransport.bluetooth,
   }) async {
     if (_started) return;
     _transport = transport;
@@ -119,8 +121,6 @@ class MeshService extends ChangeNotifier {
         'name': name ?? _defaultName(),
         'port': port,
         'peers': peers,
-        // iOS will not deliver multicast without an Apple-granted entitlement, so the
-        // phone leans on broadcast plus explicitly added peers. See docs/MOBILE.md.
         'multicast': multicast ?? !Platform.isIOS,
         'broadcast': broadcast,
       });
@@ -135,16 +135,26 @@ class MeshService extends ChangeNotifier {
       _started = true;
       _startError = null;
 
-      // Events are drained on a timer with a zero timeout, so the UI thread is never
-      // blocked waiting for a beacon that may be three seconds away.
       _eventTimer = Timer.periodic(const Duration(milliseconds: 200), (_) => _drainEvents());
       _refreshTimer = Timer.periodic(const Duration(seconds: 3), (_) => refresh());
+      _autoGpsTimer = Timer.periodic(const Duration(minutes: 2), (_) => _autoLogSafePlace());
+
       if (transport == MeshTransport.bluetooth) await _startBluetooth();
       refresh();
+      _autoLogSafePlace();
     } catch (e) {
       _startError = '$e';
     }
     notifyListeners();
+  }
+
+  Future<void> _autoLogSafePlace() async {
+    if (!_started) return;
+    final fix = await _currentFix();
+    if (fix != null) {
+      reportZone(fix.$1, fix.$2, 4); // 4 = Safe Level
+      _add(ChatKind.notice, 'auto-gps', '🟢 Safe Place logged to map (${fix.$1.toStringAsFixed(4)}, ${fix.$2.toStringAsFixed(4)})');
+    }
   }
 
   String _defaultName() {
@@ -158,6 +168,7 @@ class MeshService extends ChangeNotifier {
   void dispose() {
     _eventTimer?.cancel();
     _refreshTimer?.cancel();
+    _autoGpsTimer?.cancel();
     _bleTimer?.cancel();
     _bleEvents?.cancel();
     super.dispose();

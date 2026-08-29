@@ -239,4 +239,31 @@ impl ZoneBook {
         });
         out
     }
+
+    /// Export the aggregate zone map as a standard GeoJSON FeatureCollection JSON string
+    pub fn to_geojson(&self, me: &NodeId, now_ms: u64) -> String {
+        let views = self.views(me, now_ms);
+        let mut features = Vec::new();
+
+        for v in views {
+            let status_str = if v.level == 0 {
+                "danger"
+            } else if v.level < 200 {
+                "caution"
+            } else {
+                "safe"
+            };
+
+            let feature = format!(
+                r#"{{"type":"Feature","geometry":{{"type":"Point","coordinates":[{},{}]}},"properties":{{"cell":"{:x}","level":{},"status":"{}","consensus":{},"mine":{},"age_ms":{}}}}}"#,
+                v.lon, v.lat, v.cell, v.level, status_str, v.consensus, v.mine, v.age_ms
+            );
+            features.push(feature);
+        }
+
+        format!(
+            r#"{{"type":"FeatureCollection","features":[{}]}}"#,
+            features.join(",")
+        )
+    }
 }

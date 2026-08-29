@@ -290,13 +290,13 @@ fn gps_survives_the_beacon_fixed_point_encoding() {
 
 #[test]
 fn pre_canned_status_is_one_byte_and_parses_both_ways() {
-    assert_eq!(status::parse("medical"), Some(status::MEDICAL));
+    assert_eq!(status::parse("sos"), Some(status::MEDICAL));
     assert_eq!(status::parse("2"), Some(status::MEDICAL));
-    assert_eq!(status::parse("MEDICAL"), Some(status::MEDICAL));
+    assert_eq!(status::parse("SOS"), Some(status::MEDICAL));
     assert_eq!(status::parse("none"), Some(status::NONE));
     assert_eq!(status::parse("nonsense"), None);
     assert_eq!(status::parse("200"), None, "codes outside the table are rejected");
-    assert_eq!(status::describe(status::TRAPPED), "Trapped - need rescue");
+    assert_eq!(status::describe(status::SAFE), "🟢 Safe & Moving");
 
     // plan.md §3.2: the wire carries the code, never the words.
     let payload = NetPayload::Status {

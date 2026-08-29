@@ -27,13 +27,9 @@ pub struct Status {
 }
 
 pub const TABLE: &[Status] = &[
-    Status { code: SAFE,     name: "safe",     text: "I am safe" },
-    Status { code: MEDICAL,  name: "medical",  text: "Need medical help" },
-    Status { code: SUPPLIES, name: "supplies", text: "Need water / food" },
-    Status { code: TRAPPED,  name: "trapped",  text: "Trapped - need rescue" },
-    Status { code: MOVING,   name: "moving",   text: "Moving to a safe zone" },
-    Status { code: SHELTER,  name: "shelter",  text: "Shelter here, space available" },
-    Status { code: HAZARD,   name: "hazard",   text: "Route blocked / hazard" },
+    Status { code: SAFE,   name: "safe",   text: "🟢 Safe & Moving" },
+    Status { code: HAZARD, name: "hazard", text: "⚠️ Hazard / Danger Spot" },
+    Status { code: MEDICAL, name: "sos",   text: "🚨 SOS Emergency" },
 ];
 
 pub fn lookup(code: u8) -> Option<&'static Status> {
