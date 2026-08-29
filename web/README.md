@@ -52,9 +52,7 @@ cp assets/js/config.example.js assets/js/config.js
 Without it the map shows its fallback message and the signal log still
 works; nothing else on the page is affected.
 
-If you deploy from this repo (Netlify, Vercel, Pages), the file has to be
-created at build time or committed with a key that is restricted by HTTP
-referrer — see below.
+If you deploy from this repo (e.g. Netlify), `node build.js` runs automatically during build. Set `YOUR_GOOGLE_MAPS_API_KEY` (or `GOOGLE_MAPS_API_KEY`) as an Environment Variable in your deployment settings and `build.js` will inject it into `assets/js/config.js`.
 
 ## Google Maps key — read this before deploying
 

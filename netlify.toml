@@ -1,0 +1,4 @@
+[build]
+  base = "web"
+  command = "node build.js"
+  publish = "."
