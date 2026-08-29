@@ -1,296 +1,524 @@
 import 'dart:async';
+import 'dart:io';
+
 import 'package:flutter/foundation.dart';
 import 'package:geolocator/geolocator.dart';
-import 'rust_mesh_ffi.dart';
+import 'package:path_provider/path_provider.dart';
 
-enum MessageType { text, location, sos }
-enum MessageStatus { sending, relayed, delivered }
+import 'package:permission_handler/permission_handler.dart';
 
-class PeerNode {
-  final String id;
-  final String name;
-  final int hops;
-  final double? distanceMeters;
-  final double? lat;
-  final double? lon;
-  final bool isDirect;
+import '../bridge/ble_radio.dart';
+import '../bridge/mesh_ffi.dart';
+import '../models/mesh_models.dart';
 
-  PeerNode({
-    required this.id,
-    required this.name,
-    required this.hops,
-    this.distanceMeters,
-    this.lat,
-    this.lon,
-    required this.isDirect,
-  });
+/// Which radio the mesh is running on.
+enum MeshTransport {
+  /// UDP over Wi-Fi. Works laptop-to-laptop and phone-to-phone, but needs a shared
+  /// network or hotspot.
+  wifi,
+
+  /// Bluetooth Low Energy via the native plugin. Needs no infrastructure at all.
+  bluetooth,
 }
 
-class ChatMessageModel {
-  final String senderId;
-  final String senderName;
-  final String text;
-  final MessageType type;
-  final double? lat;
-  final double? lon;
-  final String timestamp;
-  final bool isMe;
-  final int hops;
-  final MessageStatus status;
-
-  ChatMessageModel({
-    required this.senderId,
-    required this.senderName,
-    required this.text,
-    this.type = MessageType.text,
-    this.lat,
-    this.lon,
-    required this.timestamp,
-    required this.isMe,
-    this.hops = 1,
-    this.status = MessageStatus.delivered,
-  });
-
-  /// Export as JSON payload string for mesh broadcast
-  Map<String, dynamic> toJson() {
-    return {
-      'senderId': senderId,
-      'senderName': senderName,
-      'text': text,
-      'type': type.name,
-      'lat': lat,
-      'lon': lon,
-      'timestamp': timestamp,
-      'hops': hops,
-      if (type == MessageType.sos) 'intervalMs': 300,
-    };
-  }
-}
-
+/// The app's single connection to the mesh.
+///
+/// Every mesh decision - routing, encryption, peer ranking, zone consensus, ghost
+/// detection - happens in the Rust core. This class starts that core, pushes commands
+/// into it, drains its event stream, and republishes the result to the widgets. It
+/// contains no protocol logic, and must not grow any: anything that looks like a rule
+/// about the mesh belongs in `crates/meshcore`.
 class MeshService extends ChangeNotifier {
-  String _activeNetwork = "default";
-  String _nodeId = "android-565c7b6a";
-  final List<PeerNode> _peers = [];
-  final List<ChatMessageModel> _messages = [];
-  bool _isScanning = false;
-  bool _isSosActive = false;
-  Timer? _sosTimer;
-  int _sosBroadcastCount = 0;
+  final MeshFfi _ffi;
+  final BleRadio _ble;
+  MeshService({MeshFfi? ffi, BleRadio? ble})
+      : _ffi = ffi ?? MeshFfi.instance,
+        _ble = ble ?? BleRadio();
 
-  String get activeNetwork => _activeNetwork;
-  String get nodeId => _nodeId;
-  List<PeerNode> get peers => List.unmodifiable(_peers);
-  List<ChatMessageModel> get messages => List.unmodifiable(_messages);
-  bool get isScanning => _isScanning;
-  bool get isSosActive => _isSosActive;
-  int get sosBroadcastCount => _sosBroadcastCount;
+  Timer? _eventTimer;
+  Timer? _refreshTimer;
+  Timer? _bleTimer;
+  StreamSubscription<Map<String, dynamic>>? _bleEvents;
+  MeshTransport _transport = MeshTransport.wifi;
+  int _bleConnected = 0;
+  String? _bleError;
 
-  Future<void> init() async {
-    _isScanning = true;
+  bool _started = false;
+  String? _startError;
+  Whoami? _me;
+  List<Peer> _peers = const [];
+  List<Zone> _zones = const [];
+  List<NetworkInfo> _networks = const [];
+  List<StatusCode> _statusCodes = const [];
+  final List<ChatMessage> _messages = [];
 
-    // Attempt native Rust meshcore FFI binding
-    bool rustLoaded = RustMeshFFI.loadLibrary();
-    if (rustLoaded) {
-      try {
-        final res = RustMeshFFI.initNode("/tmp/reunite_mobile", "Android-Self");
-        if (res != null && res["status"] == "ok") {
-          _nodeId = res["nodeId"] ?? _nodeId;
-          debugPrint("[MeshService] Native Rust node actor started with ID: $_nodeId");
-        }
-      } catch (e) {
-        debugPrint("[MeshService] Rust FFI init warning: $e");
-      }
-    }
+  bool get started => _started;
+  String? get startError => _startError;
+  MeshTransport get transport => _transport;
+  bool get bluetoothAvailable => BleRadio.isAvailable;
 
-    _peers.clear();
-    _peers.add(PeerNode(
-      id: "peer-a2fdb802",
-      name: "Android-Peer-1",
-      hops: 1,
-      distanceMeters: 18.5,
-      lat: -33.8688,
-      lon: 151.2093,
-      isDirect: true,
-    ));
-    _peers.add(PeerNode(
-      id: "peer-c9103a4f",
-      name: "Relay-Node-2",
-      hops: 2,
-      distanceMeters: 45.0,
-      lat: -33.8692,
-      lon: 151.2101,
-      isDirect: false,
-    ));
-    notifyListeners();
-  }
+  /// Peers the radio can actually reach right now. Zero on Bluetooth means nothing is
+  /// connected yet, which is the single most useful thing to show while someone waits.
+  int get bleConnected => _bleConnected;
+  String? get bleError => _bleError;
+  Whoami? get me => _me;
+  String get nodeId => _me?.id ?? '...';
+  String get activeNetwork => _me?.network ?? 'default';
+  bool get sosActive => _me?.sos ?? false;
+  int? get myStatus => _me?.status;
 
-  /// Toggle high-frequency 0.3s SOS Emergency Beacon
-  Future<void> toggleSos() async {
-    _isSosActive = !_isSosActive;
+  /// Already ranked nearest-first by the core, ghosts last.
+  List<Peer> get peers => List.unmodifiable(_peers);
+  List<Peer> get livePeers => _peers.where((p) => !p.ghost).toList();
+  List<Peer> get ghosts => _peers.where((p) => p.ghost).toList();
+  List<Peer> get sosPeers => _peers.where((p) => p.sos).toList();
+  List<Zone> get zones => List.unmodifiable(_zones);
+  List<NetworkInfo> get networks => List.unmodifiable(_networks);
+  List<StatusCode> get statusCodes => List.unmodifiable(_statusCodes);
+  List<ChatMessage> get messages => List.unmodifiable(_messages);
 
-    if (_isSosActive) {
-      _sosBroadcastCount = 0;
-      
-      // Fetch GPS position immediately for SOS broadcast
-      double lat = -33.8688;
-      double lon = 151.2093;
-      try {
-        Position pos = await Geolocator.getCurrentPosition(
-          desiredAccuracy: LocationAccuracy.high,
-        );
-        lat = pos.latitude;
-        lon = pos.longitude;
-      } catch (e) {
-        debugPrint("SOS GPS fetch warning: $e");
-      }
+  // ------------------------------------------------------------------ lifecycle
 
-      final now = DateTime.now();
-      final timeStr = "${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}";
-
-      // Add main SOS alert to chat
-      _messages.add(ChatMessageModel(
-        senderId: _nodeId,
-        senderName: "Android-Self",
-        text: "🚨 EMERGENCY SOS ACTIVATED - BROADCASTING BEACON (0.3s)",
-        type: MessageType.sos,
-        lat: lat,
-        lon: lon,
-        timestamp: timeStr,
-        isMe: true,
-        hops: 1,
-        status: MessageStatus.relayed,
-      ));
-
-      // Start 0.3-second rapid broadcast timer loop
-      _sosTimer?.cancel();
-      _sosTimer = Timer.periodic(const Duration(milliseconds: 300), (timer) {
-        _sosBroadcastCount++;
-        notifyListeners();
-      });
-
-      // Simulate incoming SOS confirmation from rescue relay node after 3 seconds
-      Future.delayed(const Duration(seconds: 3), () {
-        if (_isSosActive) {
-          _messages.add(ChatMessageModel(
-            senderId: "peer-c9103a4f",
-            senderName: "Rescue-Relay-2",
-            text: "🚨 RESCUE ACK: SOS Received! Emergency Team Dispatched to your GPS!",
-            type: MessageType.sos,
-            lat: lat + 0.0002,
-            lon: lon + 0.0002,
-            timestamp: "${DateTime.now().hour.toString().padLeft(2, '0')}:${DateTime.now().minute.toString().padLeft(2, '0')}",
-            isMe: false,
-            hops: 2,
-            status: MessageStatus.delivered,
-          ));
-          notifyListeners();
-        }
-      });
-    } else {
-      _sosTimer?.cancel();
-      _sosTimer = null;
-      
-      final now = DateTime.now();
-      final timeStr = "${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}";
-      _messages.add(ChatMessageModel(
-        senderId: _nodeId,
-        senderName: "Android-Self",
-        text: "🟢 SOS Emergency Beacon Deactivated (Safe)",
-        type: MessageType.text,
-        timestamp: timeStr,
-        isMe: true,
-        hops: 1,
-        status: MessageStatus.delivered,
-      ));
-    }
-    notifyListeners();
-  }
-
-  void sendMessage(String text) {
-    if (text.trim().isEmpty) return;
-    final now = DateTime.now();
-    final timeStr = "${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}";
-    
-    final newMsg = ChatMessageModel(
-      senderId: _nodeId,
-      senderName: "Android-Self",
-      text: text,
-      type: MessageType.text,
-      timestamp: timeStr,
-      isMe: true,
-      hops: 1,
-      status: MessageStatus.relayed,
-    );
-
-    _messages.add(newMsg);
-    notifyListeners();
-
-    // Simulate incoming P2P reply from mesh peer for testing
-    Future.delayed(const Duration(seconds: 2), () {
-      _messages.add(ChatMessageModel(
-        senderId: "peer-a2fdb802",
-        senderName: "Android-Peer-1",
-        text: "Received: \"$text\" via BLE mesh (1 hop)",
-        type: MessageType.text,
-        timestamp: "${DateTime.now().hour.toString().padLeft(2, '0')}:${DateTime.now().minute.toString().padLeft(2, '0')}",
-        isMe: false,
-        hops: 1,
-        status: MessageStatus.delivered,
-      ));
-      notifyListeners();
-    });
-  }
-
-  Future<void> shareCurrentLocation() async {
-    double lat = -33.8688; // Default emergency fallback coords
-    double lon = 151.2093;
-
+  /// Zero-config onboarding (plan.md §2): generate an identity, join `[default]`, done.
+  /// No account, no sign-up, and nothing here touches the internet.
+  /// [homeOverride], [port], [multicast] and [broadcast] exist so tests can start a real
+  /// node without colliding with a node already running on this machine.
+  Future<void> init({
+    List<String> peers = const [],
+    String? homeOverride,
+    int port = 47474,
+    bool? multicast,
+    bool broadcast = true,
+    String? name,
+    MeshTransport transport = MeshTransport.wifi,
+  }) async {
+    if (_started) return;
+    _transport = transport;
     try {
-      bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
-      if (serviceEnabled) {
-        LocationPermission permission = await Geolocator.checkPermission();
-        if (permission == LocationPermission.denied) {
-          permission = await Geolocator.requestPermission();
-        }
-        if (permission == LocationPermission.whileInUse ||
-            permission == LocationPermission.always) {
-          Position pos = await Geolocator.getCurrentPosition(
-            desiredAccuracy: LocationAccuracy.high,
-          );
-          lat = pos.latitude;
-          lon = pos.longitude;
+      if (transport == MeshTransport.bluetooth) {
+        final denied = await _requestBluetoothPermissions();
+        if (denied != null) {
+          _startError = denied;
+          notifyListeners();
+          return;
         }
       }
+      final String homePath;
+      if (homeOverride != null) {
+        homePath = homeOverride;
+      } else {
+        final dir = await getApplicationSupportDirectory();
+        homePath = '${dir.path}/reunite';
+      }
+      final home = Directory(homePath);
+      if (!home.existsSync()) home.createSync(recursive: true);
+
+      final reply = _ffi.start({
+        'home': home.path,
+        'transport': transport == MeshTransport.bluetooth ? 'ble' : 'udp',
+        'name': name ?? _defaultName(),
+        'port': port,
+        'peers': peers,
+        // iOS will not deliver multicast without an Apple-granted entitlement, so the
+        // phone leans on broadcast plus explicitly added peers. See docs/MOBILE.md.
+        'multicast': multicast ?? !Platform.isIOS,
+        'broadcast': broadcast,
+      });
+
+      if (reply['type'] == 'error') {
+        _startError = reply['message'] as String? ?? 'unknown error';
+        notifyListeners();
+        return;
+      }
+      _me = Whoami.fromJson(reply['whoami'] as Map<String, dynamic>);
+      _statusCodes = _ffi.statusTable().map(StatusCode.fromJson).toList();
+      _started = true;
+      _startError = null;
+
+      // Events are drained on a timer with a zero timeout, so the UI thread is never
+      // blocked waiting for a beacon that may be three seconds away.
+      _eventTimer = Timer.periodic(const Duration(milliseconds: 200), (_) => _drainEvents());
+      _refreshTimer = Timer.periodic(const Duration(seconds: 3), (_) => refresh());
+      if (transport == MeshTransport.bluetooth) await _startBluetooth();
+      refresh();
     } catch (e) {
-      debugPrint("Offline GPS fetch warning: $e");
+      _startError = '$e';
     }
-
-    final now = DateTime.now();
-    final timeStr = "${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}";
-
-    _messages.add(ChatMessageModel(
-      senderId: _nodeId,
-      senderName: "Android-Self",
-      text: "📍 Shared Emergency GPS Location",
-      type: MessageType.location,
-      lat: lat,
-      lon: lon,
-      timestamp: timeStr,
-      isMe: true,
-      hops: 1,
-      status: MessageStatus.relayed,
-    ));
     notifyListeners();
   }
 
-  void createNetwork(String name) {
-    _activeNetwork = name;
-    notifyListeners();
+  String _defaultName() {
+    if (Platform.isAndroid) return 'android';
+    if (Platform.isIOS) return 'iphone';
+    if (Platform.isMacOS) return 'mac';
+    return 'reunite';
   }
 
   @override
   void dispose() {
-    _sosTimer?.cancel();
+    _eventTimer?.cancel();
+    _refreshTimer?.cancel();
+    _bleTimer?.cancel();
+    _bleEvents?.cancel();
     super.dispose();
   }
+
+  /// Stop the node and start it again on the other radio.
+  ///
+  /// The identity, contacts, networks and zones all live on disk, so nothing is lost:
+  /// the same node comes back on a different transport.
+  Future<void> switchTransport(MeshTransport to) async {
+    if (to == _transport && _started) return;
+    _bleTimer?.cancel();
+    await _bleEvents?.cancel();
+    _bleEvents = null;
+    await _ble.stop();
+    _eventTimer?.cancel();
+    _refreshTimer?.cancel();
+    _ffi.stop();
+    _started = false;
+    _startError = null;
+    _bleError = null;
+    _bleConnected = 0;
+    _peers = const [];
+    notifyListeners();
+    await init(transport: to);
+  }
+
+  // ------------------------------------------------------------------ bluetooth
+
+  /// Android 12+ gates scanning, advertising and connecting behind separate runtime
+  /// permissions, and refuses silently without them.
+  Future<String?> _requestBluetoothPermissions() async {
+    if (!Platform.isAndroid && !Platform.isIOS) {
+      return 'Bluetooth mesh is only available on Android and iOS';
+    }
+    try {
+      final wanted = Platform.isAndroid
+          ? [Permission.bluetoothScan, Permission.bluetoothAdvertise, Permission.bluetoothConnect]
+          : [Permission.bluetooth];
+      final results = await wanted.request();
+      final refused = results.entries.where((e) => !e.value.isGranted).map((e) => e.key);
+      if (refused.isNotEmpty) {
+        return 'Bluetooth permission was refused (${refused.map((p) => p.toString().split('.').last).join(', ')}). '
+            'The mesh cannot see other phones without it.';
+      }
+      return null;
+    } catch (e) {
+      return 'could not request Bluetooth permission: $e';
+    }
+  }
+
+  Future<void> _startBluetooth() async {
+    if (!await _ble.isSupported()) {
+      _bleError = 'this device has no Bluetooth LE radio';
+      return;
+    }
+    if (!await _ble.isEnabled()) {
+      _bleError = 'Bluetooth is turned off - switch it on to reach other phones';
+      return;
+    }
+    final err = await _ble.start();
+    if (err != null) {
+      _bleError = err;
+      return;
+    }
+    _bleError = null;
+
+    // Frames arriving off the air go straight into the core.
+    _bleEvents = _ble.events().listen((event) {
+      switch (event['type'] as String?) {
+        case 'frame':
+          _ffi.bleInject(event['frame'] as String, event['from'] as String);
+          break;
+        case 'peer_lost':
+          _ffi.blePeerLost(event['device'] as String);
+          break;
+        case 'log':
+          debugPrint('BLE: ${event['message']}');
+          break;
+      }
+    }, onError: (Object e) => debugPrint('BLE event stream error: $e'));
+
+    // ...and frames the core wants sent go out to the radio. 100ms keeps beacons
+    // punctual without waking the radio pointlessly.
+    _bleTimer = Timer.periodic(const Duration(milliseconds: 100), (_) => _pumpBluetooth());
+  }
+
+  Future<void> _pumpBluetooth() async {
+    if (!_started) return;
+    final pending = _ffi.bleDrain();
+    for (final item in pending) {
+      await _ble.send(item['frame'] as String, item['to'] as String?);
+    }
+    final connected = await _ble.connectedCount();
+    if (connected != _bleConnected) {
+      _bleConnected = connected;
+      notifyListeners();
+    }
+  }
+
+  // -------------------------------------------------------------------- plumbing
+
+  Map<String, dynamic> _call(Map<String, dynamic> cmd) {
+    if (!_started) return {'type': 'error', 'message': 'mesh not started'};
+    return _ffi.command(cmd);
+  }
+
+  /// Pull everything the screens display. Cheap: these are in-memory reads in Rust.
+  void refresh() {
+    if (!_started) return;
+    final p = _call({'cmd': 'peers'});
+    if (p['type'] == 'peers') {
+      _peers = (p['peers'] as List).map((e) => Peer.fromJson(e as Map<String, dynamic>)).toList();
+    }
+    final z = _call({'cmd': 'heatmap'});
+    if (z['type'] == 'heatmap') {
+      _zones = (z['zones'] as List).map((e) => Zone.fromJson(e as Map<String, dynamic>)).toList();
+    }
+    final n = _call({'cmd': 'networks'});
+    if (n['type'] == 'networks') {
+      _networks =
+          (n['networks'] as List).map((e) => NetworkInfo.fromJson(e as Map<String, dynamic>)).toList();
+    }
+    final w = _call({'cmd': 'whoami'});
+    if (w['type'] == 'whoami') {
+      _me = Whoami.fromJson(w['whoami'] as Map<String, dynamic>);
+    }
+    notifyListeners();
+  }
+
+  void _drainEvents() {
+    if (!_started) return;
+    var changed = false;
+    // Bounded so a burst can never starve the frame.
+    for (var i = 0; i < 64; i++) {
+      final event = _ffi.pollEvent(0);
+      if (event == null) break;
+      _handleEvent(event);
+      changed = true;
+    }
+    if (changed) notifyListeners();
+  }
+
+  void _handleEvent(Map<String, dynamic> e) {
+    switch (e['type'] as String?) {
+      case 'chat':
+        _add(ChatKind.chat, e['from'] as String, e['text'] as String,
+            fromId: e['from_id'] as String?, network: e['network'] as String?, hops: e['hops'] as int?);
+        break;
+      case 'direct':
+        _add(ChatKind.direct, e['from'] as String, e['text'] as String,
+            fromId: e['from_id'] as String?, network: e['network'] as String?, hops: e['hops'] as int?);
+        break;
+      case 'sos_raised':
+        _add(ChatKind.sos, e['display'] as String,
+            'SOS - mesh alert only, emergency services were NOT called');
+        break;
+      case 'sos_cleared':
+        _add(ChatKind.notice, e['display'] as String, 'cleared their SOS');
+        break;
+      case 'status_update':
+        _add(ChatKind.status, e['display'] as String, describeStatus(e['code'] as int));
+        break;
+      case 'zone_update':
+        _add(ChatKind.notice, e['from'] as String,
+            'reported a zone: ${(e['level_scaled'] as num).toStringAsFixed(1)}/4 safe, '
+            '${e['consensus']} verifying');
+        break;
+      case 'peer_joined':
+        _add(ChatKind.notice, e['display'] as String, 'is in range');
+        break;
+      case 'peer_lost':
+        _add(ChatKind.notice, e['display'] as String, 'went quiet');
+        break;
+      case 'location_update':
+        final d = e['distance_m'] as num?;
+        _add(ChatKind.notice, e['display'] as String,
+            'shared a position${d == null ? '' : ' (${formatDistance(d.toDouble())} away)'}');
+        break;
+      case 'delivered':
+        _add(ChatKind.notice, 'you', 'delivered to ${e['to']}');
+        break;
+      case 'notice':
+        _add(ChatKind.notice, 'mesh', e['text'] as String);
+        break;
+      case 'warning':
+        _add(ChatKind.warning, 'mesh', e['text'] as String);
+        break;
+      case 'context':
+        refresh();
+        break;
+    }
+  }
+
+  void _add(ChatKind kind, String from, String text,
+      {String? fromId, String? network, int? hops}) {
+    _messages.add(ChatMessage(
+      kind: kind,
+      from: from,
+      fromId: fromId,
+      text: text,
+      network: network ?? activeNetwork,
+      hops: hops,
+    ));
+    // Keep the log bounded - a long-running node in a busy mesh must not grow forever.
+    if (_messages.length > 500) _messages.removeRange(0, _messages.length - 500);
+  }
+
+  // -------------------------------------------------------------------- commands
+
+  String? _ok(Map<String, dynamic> reply) =>
+      reply['type'] == 'error' ? reply['message'] as String? : null;
+
+  /// Broadcast to the active network. Returns an error string, or null on success.
+  String? sendMessage(String text) {
+    if (text.trim().isEmpty) return null;
+    final err = _ok(_call({'cmd': 'broadcast', 'text': text}));
+    if (err == null) _add(ChatKind.mine, 'you', text);
+    notifyListeners();
+    return err;
+  }
+
+  String? sendDirect(String target, String text) {
+    final err = _ok(_call({'cmd': 'direct', 'target': target, 'text': text}));
+    if (err == null) _add(ChatKind.mine, 'you', '-> $target: $text');
+    notifyListeners();
+    return err;
+  }
+
+  /// Raise or clear the in-network SOS.
+  ///
+  /// This alerts the mesh around you and nothing else. plan.md §3.2 isolates it from the
+  /// operating system's emergency-call path on purpose, so that testing the app can never
+  /// dial real emergency services. Do not wire this to a phone dialler.
+  String? setSos(bool active) {
+    final err = _ok(_call({'cmd': 'sos', 'on': active}));
+    refresh();
+    return err;
+  }
+
+  /// Send a pre-canned panic message. One byte on the wire.
+  String? setStatus(int code) {
+    final err = _ok(_call({'cmd': 'set_status', 'code': code}));
+    if (err == null) _add(ChatKind.mine, 'you', describeStatus(code));
+    refresh();
+    return err;
+  }
+
+  String describeStatus(int code) {
+    for (final s in _statusCodes) {
+      if (s.code == code) return s.text;
+    }
+    return code == 0 ? 'status cleared' : 'status $code';
+  }
+
+  String? reportZone(double lat, double lon, int level) {
+    final err = _ok(_call({'cmd': 'report_zone', 'lat': lat, 'lon': lon, 'level': level}));
+    refresh();
+    return err;
+  }
+
+  String? createNetwork(String name) {
+    final err = _ok(_call({'cmd': 'create_network', 'name': name}));
+    refresh();
+    return err;
+  }
+
+  String? invite(String network, String user) {
+    final err = _ok(_call({'cmd': 'invite', 'network': network, 'user': user}));
+    refresh();
+    return err;
+  }
+
+  String? switchNetwork(String name) {
+    final err = _ok(_call({'cmd': 'switch', 'name': name}));
+    refresh();
+    return err;
+  }
+
+  String? setStoring(String network, bool on) {
+    final err = _ok(_call({'cmd': 'set_storing', 'network': network, 'on': on}));
+    refresh();
+    return err;
+  }
+
+  String? kick(String user) {
+    final err = _ok(_call({'cmd': 'kick', 'user': user}));
+    refresh();
+    return err;
+  }
+
+  String? rename(String user, String name) {
+    final err = _ok(_call({'cmd': 'rename', 'user': user, 'name': name}));
+    refresh();
+    return err;
+  }
+
+  /// Read the GPS and publish it to the mesh.
+  Future<String?> shareCurrentLocation() async {
+    final fix = await _currentFix();
+    if (fix == null) {
+      return 'no GPS fix - grant location permission, or set a position manually';
+    }
+    final err = _ok(_call({'cmd': 'set_location', 'lat': fix.$1, 'lon': fix.$2}));
+    if (err != null) return err;
+    final shared = _ok(_call({'cmd': 'share_location'}));
+    refresh();
+    return shared;
+  }
+
+  String? setLocation(double lat, double lon) {
+    final err = _ok(_call({'cmd': 'set_location', 'lat': lat, 'lon': lon}));
+    refresh();
+    return err;
+  }
+
+  /// Report the safety of wherever we are standing.
+  Future<String?> reportZoneHere(int level) async {
+    final fix = await _currentFix();
+    if (fix == null) return 'no GPS fix - cannot report a zone without a position';
+    return reportZone(fix.$1, fix.$2, level);
+  }
+
+  Future<(double, double)?> _currentFix() async {
+    try {
+      if (!await Geolocator.isLocationServiceEnabled()) {
+        // Desktop and simulators often have no location service; fall back to whatever
+        // position the user already set, so the feature still works for testing.
+        final me = _me;
+        if (me?.lat != null && me?.lon != null) return (me!.lat!, me.lon!);
+        return null;
+      }
+      var permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      if (permission == LocationPermission.denied ||
+          permission == LocationPermission.deniedForever) {
+        final me = _me;
+        if (me?.lat != null && me?.lon != null) return (me!.lat!, me.lon!);
+        return null;
+      }
+      final pos = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+      );
+      return (pos.latitude, pos.longitude);
+    } catch (e) {
+      debugPrint('GPS unavailable: $e');
+      final me = _me;
+      if (me?.lat != null && me?.lon != null) return (me!.lat!, me.lon!);
+      return null;
+    }
+  }
+}
+
+String formatDistance(double metres) =>
+    metres < 1000 ? '${metres.toStringAsFixed(0)}m' : '${(metres / 1000).toStringAsFixed(2)}km';
+
+String formatAge(int ms) {
+  if (ms < 1000) return 'just now';
+  if (ms < 60000) return '${ms ~/ 1000}s ago';
+  if (ms < 3600000) return '${ms ~/ 60000}m ago';
+  return '${ms ~/ 3600000}h ago';
 }

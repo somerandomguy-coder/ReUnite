@@ -1,3 +1,13 @@
 /target
 **/*.rs.bk
 .DS_Store
+
+# Flutter / mobile build output
+mobile/build/
+mobile/.dart_tool/
+mobile/macos/Pods/
+mobile/macos/Flutter/ephemeral/
+mobile/ios/Pods/
+# Rust core binaries, produced by scripts/build_ffi.sh
+mobile/android/app/src/main/jniLibs/
+mobile/ios/Frameworks/

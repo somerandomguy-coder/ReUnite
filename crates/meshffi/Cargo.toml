@@ -1,0 +1,18 @@
+[package]
+name = "meshffi"
+description = "C ABI bridge exposing the mesh core to the Flutter UI (plan.md Phase 2)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+# staticlib for iOS/macOS linking, cdylib for Android's .so.
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+meshcore = { path = "../meshcore" }
+anyhow.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

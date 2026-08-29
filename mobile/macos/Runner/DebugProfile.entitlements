@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- The mesh needs raw UDP in both directions: it binds a port to receive beacons
+	     and sends multicast/broadcast/unicast to peers. -->
+	<key>com.apple.security.network.server</key>
+	<true/>
+	<key>com.apple.security.network.client</key>
+	<true/>
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<!-- Sandbox is off for the development build. It would block two things this app
+	     needs: loading the Rust core from ~/.reunite/lib, and binding a UDP port for
+	     peer discovery. Revisit before any signed distribution - see docs/MOBILE.md. -->
+	<key>com.apple.security.app-sandbox</key>
+	<false/>
+</dict>
+</plist>

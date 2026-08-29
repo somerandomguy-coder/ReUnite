@@ -1,162 +1,93 @@
 import 'package:flutter/material.dart';
-import '../../../services/mesh_service.dart';
+import '../../../models/mesh_models.dart';
 
 class MessageBubble extends StatelessWidget {
-  final ChatMessageModel message;
-
+  final ChatMessage message;
   const MessageBubble({super.key, required this.message});
 
   @override
   Widget build(BuildContext context) {
-    final isLocation = message.type == MessageType.location;
-    final isSos = message.type == MessageType.sos;
+    // Notices and warnings are mesh chatter, not conversation: they get a quiet
+    // centred line so they never compete with what a person actually said.
+    if (message.kind == ChatKind.notice || message.kind == ChatKind.warning) {
+      final colour = message.kind == ChatKind.warning ? Colors.orangeAccent : Colors.grey;
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 4),
+        child: Center(
+          child: Text('${message.from} ${message.text}',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: colour, fontSize: 12)),
+        ),
+      );
+    }
 
+    if (message.kind == ChatKind.sos) {
+      return Container(
+        margin: const EdgeInsets.symmetric(vertical: 6),
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: Colors.red.shade900,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: Colors.redAccent),
+        ),
+        child: Row(children: [
+          const Icon(Icons.warning_amber_rounded, color: Colors.white),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text('${message.from}: ${message.text}',
+                style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+          ),
+        ]),
+      );
+    }
+
+    if (message.kind == ChatKind.status) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 4),
+        child: Row(children: [
+          const Icon(Icons.campaign, size: 16, color: Colors.amber),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text('${message.from}: ${message.text}',
+                style: const TextStyle(color: Colors.amber, fontWeight: FontWeight.w600)),
+          ),
+        ]),
+      );
+    }
+
+    final mine = message.isMine;
     return Align(
-      alignment: message.isMe ? Alignment.centerRight : Alignment.centerLeft,
+      alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
       child: Container(
         margin: const EdgeInsets.symmetric(vertical: 4),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        constraints: const BoxConstraints(maxWidth: 320),
         decoration: BoxDecoration(
-          color: isSos
-              ? (message.isMe ? Colors.red.shade900 : Colors.redAccent.shade700)
-              : isLocation
-                  ? (message.isMe ? Colors.teal.shade800 : Colors.teal.shade900)
-                  : (message.isMe ? Colors.amber.shade800 : const Color(0xFF2A2A2A)),
-          borderRadius: BorderRadius.circular(16),
-          border: isSos
-              ? Border.all(color: Colors.redAccent, width: 2)
-              : isLocation
-                  ? Border.all(color: Colors.cyan, width: 1)
-                  : null,
-          boxShadow: isSos
-              ? [
-                  BoxShadow(
-                    color: Colors.red.withOpacity(0.5),
-                    blurRadius: 8,
-                    spreadRadius: 2,
-                  )
-                ]
+          color: mine ? Colors.teal.shade700 : const Color(0xFF2A2A2A),
+          borderRadius: BorderRadius.circular(10),
+          border: message.kind == ChatKind.direct
+              ? Border.all(color: Colors.purpleAccent, width: 1)
               : null,
         ),
         child: Column(
-          crossAxisAlignment:
-              message.isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                if (!message.isMe) ...[
-                  Text(
-                    message.senderName,
-                    style: TextStyle(
-                      color: isSos ? Colors.yellowAccent : Colors.cyan,
-                      fontSize: 12,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                ],
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                  decoration: BoxDecoration(
-                    color: Colors.black26,
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: Text(
-                    isSos ? '🚨 SOS BEACON (0.3s)' : (message.hops == 1 ? '1 hop (direct)' : '${message.hops} hops'),
-                    style: const TextStyle(
-                      color: Colors.white70,
-                      fontSize: 10,
-                    ),
-                  ),
-                ),
+            Row(mainAxisSize: MainAxisSize.min, children: [
+              Text(message.from,
+                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+              if (message.kind == ChatKind.direct) ...[
+                const SizedBox(width: 6),
+                const Text('direct',
+                    style: TextStyle(fontSize: 10, color: Colors.purpleAccent)),
               ],
-            ),
-            const SizedBox(height: 4),
-            if (isSos) ...[
-              const Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(Icons.warning_amber_rounded, color: Colors.yellowAccent, size: 20),
-                  SizedBox(width: 6),
-                  Text(
-                    'HIGH PRIORITY SOS BEACON',
-                    style: TextStyle(
-                      color: Colors.yellowAccent,
-                      fontWeight: FontWeight.bold,
-                      fontSize: 13,
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 4),
-              Text(
-                message.text,
-                style: const TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.bold),
-              ),
-              if (message.lat != null && message.lon != null) ...[
-                const SizedBox(height: 4),
-                Text(
-                  'GPS: ${message.lat!.toStringAsFixed(5)}, ${message.lon!.toStringAsFixed(5)}',
-                  style: const TextStyle(
-                    color: Colors.yellowAccent,
-                    fontFamily: 'monospace',
-                    fontSize: 12,
-                  ),
-                ),
+              if (message.hops != null) ...[
+                const SizedBox(width: 6),
+                Text('${message.hops}h',
+                    style: const TextStyle(fontSize: 10, color: Colors.grey)),
               ],
-            ] else if (isLocation) ...[
-              const Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(Icons.location_on, color: Colors.amber, size: 18),
-                  SizedBox(width: 4),
-                  Text(
-                    'GPS Position Shared',
-                    style: TextStyle(
-                      color: Colors.amber,
-                      fontWeight: FontWeight.bold,
-                      fontSize: 13,
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 4),
-              Text(
-                'Lat: ${message.lat?.toStringAsFixed(5) ?? "N/A"}\nLon: ${message.lon?.toStringAsFixed(5) ?? "N/A"}',
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontFamily: 'monospace',
-                  fontSize: 13,
-                ),
-              ),
-            ] else
-              Text(
-                message.text,
-                style: const TextStyle(color: Colors.white, fontSize: 15),
-              ),
-            const SizedBox(height: 4),
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  message.timestamp,
-                  style: const TextStyle(color: Colors.white54, fontSize: 10),
-                ),
-                if (message.isMe) ...[
-                  const SizedBox(width: 4),
-                  Icon(
-                    message.status == MessageStatus.delivered
-                        ? Icons.done_all
-                        : Icons.done,
-                    color: message.status == MessageStatus.delivered
-                        ? Colors.cyanAccent
-                        : Colors.white54,
-                    size: 14,
-                  ),
-                ],
-              ],
-            ),
+            ]),
+            const SizedBox(height: 2),
+            Text(message.text),
           ],
         ),
       ),
