@@ -36,21 +36,83 @@ final class BleMesh: NSObject {
     private let onFrame: (String, String) -> Void   // (frameHex, deviceId)
     private let onPeerLost: (String) -> Void
     private let onLog: (String) -> Void
+    private let onState: (String) -> Void
+    private let onRssi: (String, Int) -> Void
 
     private var running = false
+
+    /// Windowed scanning: listen for `scanWindow`, then sleep until `scanPeriod`.
+    ///
+    /// CoreBluetooth has **no scan-mode knob** - it decides for itself how aggressively
+    /// to listen, and there is no iOS equivalent of Android's `ScanSettings`. Nor can an
+    /// app set its advertising interval. So the only duty cycle available here is
+    /// stopping and restarting the scan, which is what this does. Saying so plainly
+    /// matters: the same ladder buys real battery on Android and much less on iOS, and a
+    /// measurement that assumes otherwise will be confusing.
+    private var scanWindow: TimeInterval?
+    private var scanPeriod: TimeInterval?
+    private var dutyTimer: Timer?
+    private var scanning = false
+
+    /// Connection attempts already in flight, and when they started.
+    ///
+    /// The scan runs with `allowDuplicates`, so a peripheral advertises into
+    /// `didDiscover` several times a second. Without this throttle every one of those
+    /// starts another `connect()` for a peripheral whose connection has not finished,
+    /// which is how CoreBluetooth ends up wedged. Android's `BleMesh.kt` has had the
+    /// same 10-second guard since it was written; this side did not.
+    private var connecting: [String: Date] = [:]
+    private static let connectRetryAfter: TimeInterval = 10
+
+    /// Chunks still to write out, per peripheral, and to notify to subscribed centrals.
+    ///
+    /// CoreBluetooth silently discards writes and notifications queued past its limit.
+    /// The previous code pushed every chunk in a loop and treated a `false` return as
+    /// "that one failed" - so a frame split across five writes arrived truncated, the
+    /// length-prefixed reassembler waited forever for bytes that were never coming, and
+    /// the link looked connected while passing nothing.
+    private var writeQueue: [String: [Data]] = [:]
+    private var notifyQueue: [Data] = []
 
     init(
         onFrame: @escaping (String, String) -> Void,
         onPeerLost: @escaping (String) -> Void,
-        onLog: @escaping (String) -> Void
+        onLog: @escaping (String) -> Void,
+        onState: @escaping (String) -> Void = { _ in },
+        onRssi: @escaping (String, Int) -> Void = { _, _ in }
     ) {
         self.onFrame = onFrame
         self.onPeerLost = onPeerLost
         self.onLog = onLog
+        self.onState = onState
+        self.onRssi = onRssi
         super.init()
     }
 
+    /// CoreBluetooth's state as a word Dart can act on.
+    static func describe(_ state: CBManagerState) -> String {
+        switch state {
+        case .poweredOn: return "on"
+        case .poweredOff: return "off"
+        case .unauthorized: return "unauthorized"
+        case .unsupported: return "unsupported"
+        case .resetting: return "resetting"
+        default: return "unknown"
+        }
+    }
+
+    /// The last state CoreBluetooth reported, or `.unknown` before it has.
+    var currentState: CBManagerState { central?.state ?? .unknown }
+
     var isSupported: Bool { true }
+
+    /// Whether the radio is powered on **as far as we currently know**.
+    ///
+    /// CoreBluetooth cannot answer this synchronously before a manager exists, and any
+    /// caller that treats a pre-`start()` answer as authoritative gets `false` every
+    /// time. That is exactly the bug this class shipped with: Dart asked, got `false`,
+    /// and refused to start the radio - telling the user to switch on Bluetooth that was
+    /// already on. Power state is reported through `onState` instead, when it is known.
     var isEnabled: Bool { central?.state == .poweredOn }
     var connectedCount: Int { Set(peerRx.keys).union(subscribers.map { $0.identifier.uuidString }).count }
 
@@ -68,15 +130,63 @@ final class BleMesh: NSObject {
     func stop() {
         guard running else { return }
         running = false
+        dutyTimer?.invalidate()
+        dutyTimer = nil
+        scanning = false
         central?.stopScan()
         peripheral?.stopAdvertising()
         for (_, p) in peers { central?.cancelPeripheralConnection(p) }
         peers.removeAll(); peerRx.removeAll(); buffers.removeAll()
         subscribers.removeAll(); discovered.removeAll()
+        connecting.removeAll(); writeQueue.removeAll(); notifyQueue.removeAll()
         peripheral?.removeAllServices()
         central = nil
         peripheral = nil
         onLog("BLE mesh stopped")
+    }
+
+    // MARK: - duty cycle
+
+    /// Change how hard the radio listens (phase 2D). `scan` is accepted for parity with
+    /// Android and recorded for the log, but only the window is actionable here.
+    func setCadence(scan: String, windowMs: Int?, periodMs: Int?) {
+        let window = windowMs.map { TimeInterval($0) / 1000 }
+        let period = periodMs.map { TimeInterval($0) / 1000 }
+        if window == scanWindow && period == scanPeriod { return }
+        scanWindow = window
+        scanPeriod = period
+        onLog("scan cadence -> \(scan)" + (window.map { " (\($0)s every \(period ?? 0)s)" } ?? ""))
+        guard running else { return }
+        dutyTimer?.invalidate()
+        dutyTimer = nil
+        startScanning()
+    }
+
+    private func startScanning() {
+        guard running, let manager = central, manager.state == .poweredOn else { return }
+        manager.scanForPeripherals(
+            withServices: [Self.serviceUUID],
+            // Duplicates carry fresh RSSI, which is the only proximity signal BLE gives
+            // us, and the mesh wants it.
+            options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
+        )
+        scanning = true
+        guard let window = scanWindow else { return }
+        dutyTimer = Timer.scheduledTimer(withTimeInterval: window, repeats: false) { [weak self] _ in
+            self?.pauseScanning()
+        }
+    }
+
+    private func pauseScanning() {
+        guard running, let window = scanWindow, let period = scanPeriod else { return }
+        central?.stopScan()
+        scanning = false
+        dutyTimer = Timer.scheduledTimer(
+            withTimeInterval: max(period - window, 0),
+            repeats: false
+        ) { [weak self] _ in
+            self?.startScanning()
+        }
     }
 
     // MARK: - framing
@@ -124,7 +234,12 @@ final class BleMesh: NSObject {
     // MARK: - sending
 
     /// Put a frame on the air. `target` names one device, or nil to reach every peer.
-    /// Returns how many peers it went to.
+    /// Returns how many peers it was queued for.
+    ///
+    /// "Queued", not "delivered": CoreBluetooth takes chunks only as fast as its transmit
+    /// queue drains, so everything here is enqueued and pumped from the two
+    /// `...IsReady...` delegate callbacks. Claiming delivery at this point is what made
+    /// the old code report success for frames it had thrown away.
     @discardableResult
     func send(frameHex: String, to target: String?) -> Int {
         guard running, let frame = Data(hex: frameHex) else { return 0 }
@@ -133,32 +248,55 @@ final class BleMesh: NSObject {
         var done = Set<String>()
 
         // As peripheral: notify every subscribed central.
-        if let tx = txCharacteristic, let manager = peripheral, !subscribers.isEmpty {
+        if txCharacteristic != nil, !subscribers.isEmpty {
             let targets = subscribers.filter { target == nil || $0.identifier.uuidString == target }
             if !targets.isEmpty {
                 let mtu = targets.map { $0.maximumUpdateValueLength }.min() ?? 20
-                var ok = true
-                for piece in chunk(payload, size: mtu) {
-                    ok = manager.updateValue(piece, for: tx, onSubscribedCentrals: targets) && ok
-                }
-                if ok {
-                    for c in targets where done.insert(c.identifier.uuidString).inserted { reached += 1 }
-                }
+                notifyQueue.append(contentsOf: chunk(payload, size: mtu))
+                pumpNotifications()
+                for c in targets where done.insert(c.identifier.uuidString).inserted { reached += 1 }
             }
         }
 
         // As central: write to every peripheral we connected out to.
-        for (id, characteristic) in peerRx {
+        for (id, _) in peerRx {
             if let target = target, id != target { continue }
             if !done.insert(id).inserted { continue }
             guard let p = peers[id] else { continue }
             let mtu = p.maximumWriteValueLength(for: .withoutResponse)
-            for piece in chunk(payload, size: mtu) {
-                p.writeValue(piece, for: characteristic, type: .withoutResponse)
-            }
+            writeQueue[id, default: []].append(contentsOf: chunk(payload, size: mtu))
+            pumpWrites(to: id)
             reached += 1
         }
         return reached
+    }
+
+    /// Drain queued notifications while the peripheral manager will take them.
+    ///
+    /// `updateValue` returns false when its queue is full; the remaining chunks stay
+    /// queued and `peripheralManagerIsReady(toUpdateSubscribers:)` calls back here.
+    private func pumpNotifications() {
+        guard let manager = peripheral, let tx = txCharacteristic else { return }
+        while let next = notifyQueue.first {
+            if manager.updateValue(next, for: tx, onSubscribedCentrals: nil) {
+                notifyQueue.removeFirst()
+            } else {
+                return   // queue full; resumed from peripheralManagerIsReady
+            }
+        }
+    }
+
+    /// Drain queued writes for one peripheral while it will accept them.
+    private func pumpWrites(to id: String) {
+        guard let p = peers[id], let characteristic = peerRx[id] else { return }
+        while let next = writeQueue[id]?.first {
+            guard p.canSendWriteWithoutResponse else {
+                return   // resumed from peripheralIsReady(toSendWriteWithoutResponse:)
+            }
+            p.writeValue(next, for: characteristic, type: .withoutResponse)
+            writeQueue[id]?.removeFirst()
+        }
+        if writeQueue[id]?.isEmpty == true { writeQueue[id] = nil }
     }
 }
 
@@ -166,6 +304,7 @@ final class BleMesh: NSObject {
 
 extension BleMesh: CBPeripheralManagerDelegate {
     func peripheralManagerDidUpdateState(_ manager: CBPeripheralManager) {
+        onState(Self.describe(manager.state))
         guard manager.state == .poweredOn, running else { return }
         let rx = CBMutableCharacteristic(
             type: Self.rxUUID,
@@ -194,9 +333,16 @@ extension BleMesh: CBPeripheralManagerDelegate {
                 ingest(value, from: request.central.identifier.uuidString)
             }
         }
-        if let first = requests.first {
-            manager.respond(to: first, withResult: .success)
+        // Every request needs its own response. Answering only the first leaves a central
+        // waiting on a `.withResponse` write until it times out, which stalls that link.
+        for request in requests {
+            manager.respond(to: request, withResult: .success)
         }
+    }
+
+    /// The transmit queue drained; keep going.
+    func peripheralManagerIsReady(toUpdateSubscribers manager: CBPeripheralManager) {
+        pumpNotifications()
     }
 
     func peripheralManager(
@@ -226,15 +372,13 @@ extension BleMesh: CBPeripheralManagerDelegate {
 
 extension BleMesh: CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ manager: CBCentralManager) {
+        // Reported whether or not we are running: this is the only authoritative answer
+        // to "is Bluetooth on", and Dart needs it to decide what to tell the user.
+        onState(Self.describe(manager.state))
         guard running else { return }
         switch manager.state {
         case .poweredOn:
-            manager.scanForPeripherals(
-                withServices: [Self.serviceUUID],
-                // Duplicates carry fresh RSSI, which is the only proximity signal BLE
-                // gives us, and the mesh wants it.
-                options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
-            )
+            startScanning()
             onLog("scanning for mesh peers")
         case .poweredOff:
             onLog("Bluetooth is turned off")
@@ -252,7 +396,19 @@ extension BleMesh: CBCentralManagerDelegate {
         rssi RSSI: NSNumber
     ) {
         let id = peripheral.identifier.uuidString
+        // Signal strength is the only proximity measure BLE gives us, and it arrives
+        // here on every advertisement - including from peers we never connect to.
+        onRssi(id, RSSI.intValue)
+
         guard peers[id] == nil else { return }
+        // Scan results repeat several times a second. Without this throttle every repeat
+        // starts another connection attempt for a peripheral whose connection is still in
+        // flight, and the stack collapses under them. Mirrors Android's `connectTo`.
+        if let started = connecting[id], Date().timeIntervalSince(started) < Self.connectRetryAfter {
+            return
+        }
+        connecting[id] = Date()
+
         // Hold a strong reference: CoreBluetooth drops peripherals it does not own and
         // the connection silently never completes.
         discovered[id] = peripheral
@@ -265,6 +421,7 @@ extension BleMesh: CBCentralManagerDelegate {
         let id = peripheral.identifier.uuidString
         peers[id] = peripheral
         discovered[id] = nil
+        connecting[id] = nil
         peripheral.discoverServices([Self.serviceUUID])
     }
 
@@ -277,6 +434,8 @@ extension BleMesh: CBCentralManagerDelegate {
         peers[id] = nil
         peerRx[id] = nil
         buffers[id] = nil
+        connecting[id] = nil
+        writeQueue[id] = nil
         if !subscribers.contains(where: { $0.identifier.uuidString == id }) { onPeerLost(id) }
     }
 
@@ -285,7 +444,12 @@ extension BleMesh: CBCentralManagerDelegate {
         didFailToConnect peripheral: CBPeripheral,
         error: Error?
     ) {
-        discovered[peripheral.identifier.uuidString] = nil
+        let id = peripheral.identifier.uuidString
+        discovered[id] = nil
+        // Clear the throttle so the next advertisement retries immediately rather than
+        // waiting out a window that was meant for a connection still in progress.
+        connecting[id] = nil
+        onLog("connect to \(id) failed: \(error?.localizedDescription ?? "unknown")")
     }
 }
 
@@ -313,6 +477,8 @@ extension BleMesh: CBPeripheralDelegate {
             }
         }
         onLog("\(id) is a mesh peer")
+        // Anything queued while the characteristics were still being discovered.
+        pumpWrites(to: id)
     }
 
     func peripheral(
@@ -322,6 +488,11 @@ extension BleMesh: CBPeripheralDelegate {
     ) {
         guard characteristic.uuid == Self.txUUID, let value = characteristic.value else { return }
         ingest(value, from: peripheral.identifier.uuidString)
+    }
+
+    /// The peripheral will take more writes; continue where `pumpWrites` stopped.
+    func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
+        pumpWrites(to: peripheral.identifier.uuidString)
     }
 }
 

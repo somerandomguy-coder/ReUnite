@@ -61,14 +61,26 @@ fn the_bridge_starts_a_node_and_answers_every_ui_command() {
     assert_eq!(call(mesh_command, r#"{"cmd":"sos","on":true}"#)["type"], "ok");
     let zone = call(
         mesh_command,
-        r#"{"cmd":"report_zone","lat":10.7769,"lon":106.7009,"level":4}"#,
+        r#"{"cmd":"report_zone","lat":10.7769,"lon":106.7009,"verdict":"unsafe","radius_m":750}"#,
     );
     assert_eq!(zone["type"], "ok");
 
     let heat = call(mesh_command, r#"{"cmd":"heatmap"}"#);
-    assert_eq!(heat["zones"][0]["consensus"], 1);
+    assert_eq!(heat["zones"][0]["verdict"], "unsafe");
+    assert_eq!(heat["zones"][0]["radius_m"], 750);
+    assert_eq!(heat["zones"][0]["unsafe_votes"], 1);
+    assert_eq!(heat["zones"][0]["safe_votes"], 0);
     assert_eq!(heat["zones"][0]["mine"], true);
-    assert!((heat["zones"][0]["level_scaled"].as_f64().unwrap() - 4.0).abs() < 0.01);
+
+    // The bridge must refuse a verdict it does not understand rather than guessing one -
+    // a guess here paints a real street the wrong colour.
+    assert_eq!(
+        call(
+            mesh_command,
+            r#"{"cmd":"report_zone","lat":10.0,"lon":106.0,"verdict":"maybe","radius_m":100}"#,
+        )["type"],
+        "error",
+    );
 
     let who = call(mesh_command, r#"{"cmd":"whoami"}"#);
     assert_eq!(who["whoami"]["sos"], true);
@@ -187,17 +199,37 @@ fn the_bridge_starts_a_node_and_answers_every_ui_command() {
     assert!(!mesh_stop(), "stopping twice is a no-op, not a crash");
 }
 
+/// The UI builds its panic buttons from this table, so what matters is that the bridge
+/// reproduces `meshcore::status::TABLE` faithfully - not that the table has any particular
+/// contents. Asserting the contents is how this test came to fail when the table was
+/// deliberately cut from seven codes to three: it was testing a product decision, which
+/// belongs in a product decision's own review, not in the FFI contract.
 #[test]
 fn the_status_table_comes_from_the_core() {
     unsafe {
         let raw = mesh_status_table();
         let text = CStr::from_ptr(raw).to_str().unwrap().to_owned();
         mesh_free(raw);
-        let rows: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(rows.as_array().unwrap().len(), 7);
-        assert_eq!(rows[1]["name"], "medical");
-        assert_eq!(rows[1]["code"], 2);
-        assert_eq!(rows[1]["text"], "Need medical help");
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(
+            rows.len(),
+            meshcore::status::TABLE.len(),
+            "the bridge must expose every code the core carries, and no others",
+        );
+        assert!(!rows.is_empty(), "a UI with no panic buttons is not a UI");
+
+        for (row, expected) in rows.iter().zip(meshcore::status::TABLE) {
+            assert_eq!(row["code"], expected.code);
+            assert_eq!(row["name"], expected.name);
+            assert_eq!(row["text"], expected.text);
+        }
+
+        let mut codes: Vec<u64> = rows.iter().map(|r| r["code"].as_u64().unwrap()).collect();
+        codes.sort_unstable();
+        let unique = codes.len();
+        codes.dedup();
+        assert_eq!(codes.len(), unique, "two statuses share one wire code");
     }
 }
 

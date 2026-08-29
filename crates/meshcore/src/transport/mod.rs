@@ -10,6 +10,7 @@
 //! frames cross the FFI boundary in both directions.
 
 pub mod external;
+pub mod multi;
 pub mod udp;
 
 #[cfg(target_os = "linux")]
@@ -21,6 +22,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 pub use external::{ExternalTransport, Outbound};
+pub use multi::MultiTransport;
 pub use udp::{UdpConfig, UdpTransport};
 
 #[cfg(target_os = "linux")]
@@ -37,4 +39,14 @@ pub trait Transport: Send + Sync {
     async fn recv(&self) -> Result<(Vec<u8>, SocketAddr)>;
     /// Human readable description for the banner.
     fn describe(&self) -> String;
+
+    /// Signal strength the radio last reported for this link, in dBm.
+    ///
+    /// Only a radio that measures one can answer. UDP cannot - Wi-Fi RSSI belongs to the
+    /// association, not to a peer - so the default is `None` and the router simply has no
+    /// signal column for it. Bluetooth reports it per advertisement, which is the whole
+    /// reason `Router::note_rssi` exists.
+    fn rssi_for(&self, _addr: &SocketAddr) -> Option<i16> {
+        None
+    }
 }

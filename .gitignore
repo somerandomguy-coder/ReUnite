@@ -11,3 +11,8 @@ mobile/ios/Pods/
 # Rust core binaries, produced by scripts/build_ffi.sh
 mobile/android/app/src/main/jniLibs/
 mobile/ios/Frameworks/
+
+# Editor swap files. `.Cargo.toml.swp` was committed once by accident; the pattern is
+# broad so the next one never is.
+*.sw[a-p]
+*~

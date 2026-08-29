@@ -24,7 +24,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use meshcore::node::{Command, Event, Node, NodeConfig, NodeHandle};
 use meshcore::store::resolve_home;
-use meshcore::transport::{ExternalTransport, Transport, UdpConfig, UdpTransport};
+use meshcore::transport::{ExternalTransport, MultiTransport, Transport, UdpConfig, UdpTransport};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
@@ -126,35 +126,72 @@ fn start_inner(config_json: &str) -> Result<String> {
 
     let name = cfg.name.clone();
     let battery = cfg.battery;
-    let use_ble = cfg.transport.eq_ignore_ascii_case("ble");
 
-    let mut ble_transport: Option<std::sync::Arc<ExternalTransport>> = None;
-    let (handle, events) = if use_ble {
-        // The radio is Kotlin or Swift; Rust only queues frames for it.
-        let external = std::sync::Arc::new(ExternalTransport::new("ble (native radio)"));
-        ble_transport = Some(external.clone());
-        runtime.block_on(async move {
-            let mut node = NodeConfig::new(home);
-            node.self_name = name;
-            node.battery_override = battery;
-            Node::spawn(node, external as std::sync::Arc<dyn Transport>)
-        })?
-    } else {
-        runtime.block_on(async move {
-            let udp = UdpTransport::bind(UdpConfig {
+    // Phase 2D: every radio at once, not a choice.
+    //
+    // `transport` is now a *hint* about which radios to try, kept only so the CLI and the
+    // tests can still pin one. The app passes "all" and gets whatever this device has.
+    // The picker it replaced was a configuration question put to somebody in an
+    // emergency, and its correct answer was always "all of them".
+    let want = cfg.transport.to_ascii_lowercase();
+    let want_ble = want == "ble" || want == "all";
+    let want_udp = want == "udp" || want == "all";
+
+    // The BLE handle comes back out of the async block rather than being captured, so
+    // the platform layer can keep feeding it after start returns.
+    let (handle, events, ble_transport) = runtime.block_on(async move {
+        let mut ble_transport: Option<std::sync::Arc<ExternalTransport>> = None;
+        let mut radios: Vec<std::sync::Arc<dyn Transport>> = Vec::new();
+        let mut failures: Vec<String> = Vec::new();
+
+        if want_ble {
+            // The radio itself is Kotlin or Swift; Rust only queues frames for it. There
+            // is nothing here that can fail, so a phone always has this one - whether the
+            // radio behind it is on is the platform's business, reported separately.
+            let external = std::sync::Arc::new(ExternalTransport::new("ble (native radio)"));
+            ble_transport = Some(external.clone());
+            radios.push(external as std::sync::Arc<dyn Transport>);
+        }
+
+        if want_udp {
+            // Binding can genuinely fail - the port is taken, or the OS refuses. That
+            // must cost this one radio, not the node: a phone with no Wi-Fi still meshes
+            // over Bluetooth.
+            match UdpTransport::bind(UdpConfig {
                 port: cfg.port,
                 group: std::net::Ipv4Addr::new(239, 42, 13, 7),
                 multicast: cfg.multicast,
                 broadcast: cfg.broadcast,
                 seeds,
-            })?;
-            let _ = udp.describe();
-            let mut node = NodeConfig::new(home);
-            node.self_name = name;
-            node.battery_override = battery;
-            Node::spawn(node, std::sync::Arc::new(udp))
-        })?
-    };
+            }) {
+                Ok(udp) => radios.push(std::sync::Arc::new(udp)),
+                Err(e) => failures.push(format!("wi-fi: {e}")),
+            }
+        }
+
+        if radios.is_empty() {
+            return Err(anyhow!(
+                "no radio could be started ({})",
+                if failures.is_empty() {
+                    "none were requested".to_string()
+                } else {
+                    failures.join("; ")
+                }
+            ));
+        }
+
+        let transport: std::sync::Arc<dyn Transport> = if radios.len() == 1 {
+            radios.remove(0)
+        } else {
+            std::sync::Arc::new(MultiTransport::new(radios)?)
+        };
+
+        let mut node = NodeConfig::new(home);
+        node.self_name = name;
+        node.battery_override = battery;
+        let (handle, events) = Node::spawn(node, transport)?;
+        Ok::<_, anyhow::Error>((handle, events, ble_transport))
+    })?;
 
     *bridge_slot()
         .write()
@@ -244,11 +281,16 @@ fn to_command(d: CommandDto) -> Result<Command> {
         "set_status" => Command::SetStatus {
             code: need(d.code, "code")?,
         },
-        "report_zone" => Command::ReportZone {
-            lat: need(d.lat, "lat")?,
-            lon: need(d.lon, "lon")?,
-            level: need(d.level, "level")?,
-        },
+        "report_zone" => {
+            let word = need(d.verdict, "verdict")?;
+            Command::ReportZone {
+                lat: need(d.lat, "lat")?,
+                lon: need(d.lon, "lon")?,
+                verdict: meshcore::zones::parse_verdict(&word)
+                    .ok_or_else(|| anyhow!("verdict must be 'safe' or 'unsafe', not '{word}'"))?,
+                radius_m: need(d.radius_m, "radius_m")?,
+            }
+        }
         "heatmap" => Command::Heatmap,
         other => return Err(anyhow!("unknown command '{other}'")),
     })
@@ -367,6 +409,30 @@ fn inject_inner(json: &str) -> Result<()> {
     let from = value["from"].as_str().ok_or_else(|| anyhow!("missing 'from'"))?;
     let frame = hex::decode(frame_hex)?;
     ble.inject(frame, from)
+}
+
+/// Record the signal strength the scanner saw for one device.
+///
+/// Input: `{"device":"<device id>","rssi":-57}`.
+///
+/// Kept separate from `mesh_ble_inject` because the two arrive at completely different
+/// rates: a scanner reports RSSI several times a second for every device in range,
+/// including ones that have never sent us a frame and may never connect.
+///
+/// # Safety
+/// `json` must be a valid NUL-terminated UTF-8 C string.
+#[no_mangle]
+pub unsafe extern "C" fn mesh_ble_rssi(json: *const c_char) {
+    let Ok(text) = as_str(json) else { return };
+    let Some(b) = bridge() else { return };
+    let Some(ble) = b.ble.as_ref() else { return };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return;
+    };
+    let (Some(device), Some(rssi)) = (value["device"].as_str(), value["rssi"].as_i64()) else {
+        return;
+    };
+    ble.note_rssi(device, rssi.clamp(i16::MIN as i64, i16::MAX as i64) as i16);
 }
 
 /// A Bluetooth peer disconnected; drop its link mapping so a reconnection starts clean.

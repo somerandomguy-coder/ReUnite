@@ -46,18 +46,23 @@ class Peer {
   bool get hasPosition => lat != null && lon != null;
 }
 
+/// One aggregated cell: is the area around it safe, how far does that reach, and how
+/// many people are on each side of the question.
 class Zone {
   final String cell;
   final double lat;
   final double lon;
-  final int level;
 
-  /// The 0..=4 user scale, fractional so a mixed average is visible.
-  final double levelScaled;
+  /// "safe" or "unsafe". Ties resolve to unsafe in the core, not here.
+  final String verdict;
 
-  /// How many distinct nodes verified this cell. plan.md §3.2 requires this be shown
-  /// alongside the colour, never folded into it.
-  final int consensus;
+  /// Metres. The map draws a circle of this radius centred on (lat, lon).
+  final int radiusM;
+
+  /// Kept as two numbers, never one. plan.md §3.2 requires the count be visible next to
+  /// the colour; folding them into a single score is what hid disagreement before.
+  final int safeVotes;
+  final int unsafeVotes;
   final int ageMs;
   final bool mine;
 
@@ -65,14 +70,42 @@ class Zone {
       : cell = j['cell'] as String,
         lat = (j['lat'] as num).toDouble(),
         lon = (j['lon'] as num).toDouble(),
-        level = j['level'] as int,
-        levelScaled = (j['level_scaled'] as num).toDouble(),
-        consensus = j['consensus'] as int,
+        verdict = j['verdict'] as String,
+        radiusM = j['radius_m'] as int,
+        safeVotes = j['safe_votes'] as int,
+        unsafeVotes = j['unsafe_votes'] as int,
         ageMs = j['age_ms'] as int,
         mine = j['mine'] as bool;
 
-  bool get verified => consensus > 1;
+  bool get isSafe => verdict == 'safe';
+  int get totalVotes => safeVotes + unsafeVotes;
+
+  /// True when people are actively reporting this cell both ways. Worth surfacing on its
+  /// own: a contested area is a different thing from an unverified one.
+  bool get contested => safeVotes > 0 && unsafeVotes > 0;
+  bool get verified => totalVotes > 1;
 }
+
+/// The length units the reporter can type in. Feet and miles are here because the people
+/// who need this app are not all on the metric system.
+enum RadiusUnit {
+  metres('m', 'metres', 1.0),
+  kilometres('km', 'kilometres', 1000.0),
+  feet('ft', 'feet', 0.3048),
+  miles('mi', 'miles', 1609.344);
+
+  final String short;
+  final String label;
+  final double inMetres;
+  const RadiusUnit(this.short, this.label, this.inMetres);
+
+  int toMetres(double length) => (length * inMetres).round();
+}
+
+/// Mirrors `zones::MIN_RADIUS_M` / `MAX_RADIUS_M`. Duplicated deliberately so the field
+/// can reject a bad number before a round trip; the core validates again regardless.
+const int kMinRadiusM = 10;
+const int kMaxRadiusM = 20000;
 
 class NetworkInfo {
   final String id;
@@ -157,3 +190,7 @@ class ChatMessage {
 
   bool get isMine => kind == ChatKind.mine;
 }
+
+/// Human-readable radius, mirroring `zones::fmt_radius` in the core.
+String formatRadius(int metres) =>
+    metres >= 1000 ? '${(metres / 1000).toStringAsFixed(1)} km' : '$metres m';

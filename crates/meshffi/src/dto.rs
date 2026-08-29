@@ -141,11 +141,14 @@ pub struct ZoneDto {
     pub cell: String,
     pub lat: f64,
     pub lon: f64,
-    /// Wire byte, 0..=255.
-    pub level: u8,
-    /// The 0..=4 user scale, fractional so a mixed average is visible.
-    pub level_scaled: f64,
-    pub consensus: u8,
+    /// "safe" or "unsafe" - the aggregate call, ties resolving to unsafe.
+    pub verdict: String,
+    /// Metres. The map draws a circle of this radius at (lat, lon).
+    pub radius_m: u32,
+    /// Kept apart on purpose (plan.md §3.2): the UI must be able to show that people
+    /// disagree, which a single blended number cannot express.
+    pub safe_votes: u32,
+    pub unsafe_votes: u32,
     pub age_ms: u64,
     pub mine: bool,
 }
@@ -156,9 +159,10 @@ impl From<&ZoneView> for ZoneDto {
             cell: format!("{:x}", z.cell),
             lat: z.lat,
             lon: z.lon,
-            level: z.level,
-            level_scaled: meshcore::zones::byte_to_level(z.level),
-            consensus: z.consensus,
+            verdict: z.verdict.as_str().to_string(),
+            radius_m: z.radius_m,
+            safe_votes: z.safe_votes,
+            unsafe_votes: z.unsafe_votes,
             age_ms: z.age_ms,
             mine: z.mine,
         }
@@ -281,14 +285,21 @@ pub enum EventDto {
     },
     ZoneUpdate {
         cell: String,
-        level: u8,
-        level_scaled: f64,
-        consensus: u8,
+        verdict: String,
+        radius_m: u32,
+        safe_votes: u32,
+        unsafe_votes: u32,
         from: String,
     },
     Delivered {
         to: String,
         preview: String,
+    },
+    Cadence {
+        hello_ms: u64,
+        scan: String,
+        window_ms: Option<u64>,
+        period_ms: Option<u64>,
     },
     Context {
         network: String,
@@ -349,14 +360,32 @@ impl From<Event> for EventDto {
                 id: id.to_hex(),
                 display,
             },
-            Event::ZoneUpdate { cell, level, consensus, from } => EventDto::ZoneUpdate {
+            Event::ZoneUpdate {
+                cell,
+                verdict,
+                radius_m,
+                safe_votes,
+                unsafe_votes,
+                from,
+            } => EventDto::ZoneUpdate {
                 cell: format!("{cell:x}"),
-                level,
-                level_scaled: meshcore::zones::byte_to_level(level),
-                consensus,
+                verdict: verdict.as_str().to_string(),
+                radius_m,
+                safe_votes,
+                unsafe_votes,
                 from,
             },
             Event::Delivered { to, preview } => EventDto::Delivered { to, preview },
+            Event::Cadence {
+                hello_ms,
+                scan,
+                scan_window_ms,
+            } => EventDto::Cadence {
+                hello_ms,
+                scan: scan.to_string(),
+                window_ms: scan_window_ms.map(|(w, _)| w),
+                period_ms: scan_window_ms.map(|(_, p)| p),
+            },
             Event::Context(network) => EventDto::Context { network },
             Event::Notice(text) => EventDto::Notice { text },
             Event::Warning(text) => EventDto::Warning { text },
@@ -419,8 +448,13 @@ pub struct CommandDto {
     pub lat: Option<f64>,
     #[serde(default)]
     pub lon: Option<f64>,
+    /// "safe" or "unsafe".
     #[serde(default)]
-    pub level: Option<u8>,
+    pub verdict: Option<String>,
+    /// Already in metres. The UI owns the unit picker and converts before it calls in,
+    /// so the core has exactly one length unit and no chance of a mixed-unit bug.
+    #[serde(default)]
+    pub radius_m: Option<u32>,
     #[serde(default)]
     pub limit: Option<usize>,
 }

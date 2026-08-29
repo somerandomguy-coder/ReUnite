@@ -28,12 +28,30 @@ class BleRadio {
     }
   }
 
+  /// Whether the radio is powered on, **as far as the platform currently knows**.
+  ///
+  /// On iOS this is unanswerable until CoreBluetooth has reported in, which it does not
+  /// do until a manager exists. Treating a pre-start answer as authoritative is the bug
+  /// that kept the iPhone off the mesh entirely: it always read false, and the app
+  /// refused to start the radio rather than letting the platform tell it otherwise.
+  /// Prefer the asynchronous `radio_state` event; use this only for a display hint.
   Future<bool> isEnabled() async {
     if (!isAvailable) return false;
     try {
       return await _method.invokeMethod<bool>('isEnabled') ?? false;
     } on PlatformException {
       return false;
+    }
+  }
+
+  /// Best current knowledge of the radio state: `on`, `off`, `unauthorized`,
+  /// `unsupported`, `resetting` or `unknown`.
+  Future<String> state() async {
+    if (!isAvailable) return 'unsupported';
+    try {
+      return await _method.invokeMethod<String>('state') ?? 'unknown';
+    } on PlatformException {
+      return 'unknown';
     }
   }
 
@@ -76,6 +94,28 @@ class BleRadio {
     } on PlatformException catch (e) {
       debugPrint('BLE send failed: ${e.message}');
       return 0;
+    }
+  }
+
+  /// Tell the radio how hard to listen (phase 2D).
+  ///
+  /// [scan] is `low_latency`, `balanced` or `low_power`. A non-null [windowMs] and
+  /// [periodMs] ask for a windowed scan - listen for the window, sleep out the period -
+  /// which is what actually saves the battery once nobody is around.
+  Future<void> setCadence({
+    required String scan,
+    int? windowMs,
+    int? periodMs,
+  }) async {
+    if (!isAvailable) return;
+    try {
+      await _method.invokeMethod<void>('setCadence', {
+        'scan': scan,
+        'windowMs': windowMs,
+        'periodMs': periodMs,
+      });
+    } on PlatformException catch (e) {
+      debugPrint('BLE setCadence failed: ${e.message}');
     }
   }
 

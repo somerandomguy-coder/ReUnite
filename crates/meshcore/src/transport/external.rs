@@ -84,6 +84,12 @@ pub struct ExternalTransport {
     inbound_rx: AsyncMutex<mpsc::Receiver<(Vec<u8>, SocketAddr)>>,
     outbound: Mutex<VecDeque<Outbound>>,
     links: Mutex<LinkTable>,
+    /// Last signal strength the platform reported per device.
+    ///
+    /// Keyed by device id rather than node id on purpose: the scanner sees an
+    /// advertisement long before we know which node is behind it, and a reading we
+    /// cannot yet attribute is still worth keeping until the first frame names it.
+    rssi: Mutex<HashMap<String, i16>>,
     label: String,
     /// Bound on the outbound backlog. If the platform stops draining - the radio is off,
     /// Bluetooth permission was refused - the queue must not grow without limit.
@@ -98,6 +104,7 @@ impl ExternalTransport {
             inbound_rx: AsyncMutex::new(inbound_rx),
             outbound: Mutex::new(VecDeque::new()),
             links: Mutex::new(LinkTable::default()),
+            rssi: Mutex::new(HashMap::new()),
             label: label.into(),
             capacity: 256,
         }
@@ -126,11 +133,21 @@ impl ExternalTransport {
         self.outbound.lock().map(|q| q.len()).unwrap_or(0)
     }
 
+    /// Record the signal strength the scanner saw for one device.
+    pub fn note_rssi(&self, device: &str, rssi: i16) {
+        if let Ok(mut map) = self.rssi.lock() {
+            map.insert(device.to_string(), rssi);
+        }
+    }
+
     /// A device disconnected. Drop its address mapping so a later reconnection gets a
     /// fresh one rather than inheriting a stale route.
     pub fn peer_lost(&self, device: &str) {
         if let Ok(mut links) = self.links.lock() {
             links.forget(device);
+        }
+        if let Ok(mut map) = self.rssi.lock() {
+            map.remove(device);
         }
     }
 
@@ -180,5 +197,10 @@ impl Transport for ExternalTransport {
 
     fn describe(&self) -> String {
         self.label.clone()
+    }
+
+    fn rssi_for(&self, addr: &SocketAddr) -> Option<i16> {
+        let device = self.links.lock().ok()?.device_for(addr)?;
+        self.rssi.lock().ok()?.get(&device).copied()
     }
 }
