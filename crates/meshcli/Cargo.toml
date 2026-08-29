@@ -1,0 +1,16 @@
+[package]
+name = "meshcli"
+description = "Terminal client for the offline P2P emergency mesh network"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "meshnet"
+path = "src/main.rs"
+
+[dependencies]
+meshcore = { path = "../meshcore" }
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
