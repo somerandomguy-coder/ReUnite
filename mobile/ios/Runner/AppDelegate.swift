@@ -18,6 +18,10 @@ import UIKit
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
+    let controller = window?.rootViewController as? FlutterViewController
+    if let messenger = controller?.binaryMessenger {
+      register(with: messenger)
+    }
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
   }
 
