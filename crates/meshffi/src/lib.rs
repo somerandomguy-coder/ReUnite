@@ -18,13 +18,13 @@ mod dto;
 
 use std::ffi::{c_char, CStr, CString};
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use meshcore::node::{Command, Event, Node, NodeConfig, NodeHandle};
 use meshcore::store::resolve_home;
-use meshcore::transport::{Transport, UdpConfig, UdpTransport};
+use meshcore::transport::{ExternalTransport, Transport, UdpConfig, UdpTransport};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
@@ -34,11 +34,24 @@ struct Bridge {
     runtime: Runtime,
     handle: NodeHandle,
     events: Mutex<mpsc::Receiver<Event>>,
+    /// Present only when the node was started on the `ble` transport. The platform's
+    /// Bluetooth layer drains and feeds this; see `transport/external.rs`.
+    ble: Option<std::sync::Arc<ExternalTransport>>,
 }
 
-fn bridge() -> &'static OnceLock<Bridge> {
-    static BRIDGE: OnceLock<Bridge> = OnceLock::new();
-    &BRIDGE
+/// The running node, if any.
+///
+/// An `RwLock<Option<Arc<..>>>` rather than a `OnceLock`, because switching transport -
+/// Wi-Fi to Bluetooth and back - has to stop one node and start another in the same
+/// process. Callers clone the `Arc` out under a short read lock and release it before
+/// doing any blocking work, so a slow command cannot stall the BLE drain.
+fn bridge_slot() -> &'static RwLock<Option<Arc<Bridge>>> {
+    static BRIDGE: OnceLock<RwLock<Option<Arc<Bridge>>>> = OnceLock::new();
+    BRIDGE.get_or_init(|| RwLock::new(None))
+}
+
+fn bridge() -> Option<Arc<Bridge>> {
+    bridge_slot().read().ok()?.clone()
 }
 
 // ------------------------------------------------------------------ ffi helpers
@@ -93,7 +106,7 @@ pub unsafe extern "C" fn mesh_start(config_json: *const c_char) -> *mut c_char {
 }
 
 fn start_inner(config_json: &str) -> Result<String> {
-    if bridge().get().is_some() {
+    if bridge().is_some() {
         // Already running (hot restart): report the live node rather than binding twice.
         return command_inner(r#"{"cmd":"whoami"}"#);
     }
@@ -111,26 +124,46 @@ fn start_inner(config_json: &str) -> Result<String> {
         .filter_map(|p| p.parse().ok())
         .collect::<Vec<_>>();
 
-    let (handle, events) = runtime.block_on(async move {
-        let udp = UdpTransport::bind(UdpConfig {
-            port: cfg.port,
-            group: std::net::Ipv4Addr::new(239, 42, 13, 7),
-            multicast: cfg.multicast,
-            broadcast: cfg.broadcast,
-            seeds,
-        })?;
-        let _ = udp.describe();
-        let mut node = NodeConfig::new(home);
-        node.self_name = cfg.name.clone();
-        node.battery_override = cfg.battery;
-        Node::spawn(node, std::sync::Arc::new(udp))
-    })?;
+    let name = cfg.name.clone();
+    let battery = cfg.battery;
+    let use_ble = cfg.transport.eq_ignore_ascii_case("ble");
 
-    let _ = bridge().set(Bridge {
+    let mut ble_transport: Option<std::sync::Arc<ExternalTransport>> = None;
+    let (handle, events) = if use_ble {
+        // The radio is Kotlin or Swift; Rust only queues frames for it.
+        let external = std::sync::Arc::new(ExternalTransport::new("ble (native radio)"));
+        ble_transport = Some(external.clone());
+        runtime.block_on(async move {
+            let mut node = NodeConfig::new(home);
+            node.self_name = name;
+            node.battery_override = battery;
+            Node::spawn(node, external as std::sync::Arc<dyn Transport>)
+        })?
+    } else {
+        runtime.block_on(async move {
+            let udp = UdpTransport::bind(UdpConfig {
+                port: cfg.port,
+                group: std::net::Ipv4Addr::new(239, 42, 13, 7),
+                multicast: cfg.multicast,
+                broadcast: cfg.broadcast,
+                seeds,
+            })?;
+            let _ = udp.describe();
+            let mut node = NodeConfig::new(home);
+            node.self_name = name;
+            node.battery_override = battery;
+            Node::spawn(node, std::sync::Arc::new(udp))
+        })?
+    };
+
+    *bridge_slot()
+        .write()
+        .map_err(|_| anyhow!("bridge lock poisoned"))? = Some(Arc::new(Bridge {
         runtime,
         handle,
         events: Mutex::new(events),
-    });
+        ble: ble_transport,
+    }));
     command_inner(r#"{"cmd":"whoami"}"#)
 }
 
@@ -164,7 +197,7 @@ pub unsafe extern "C" fn mesh_command(cmd_json: *const c_char) -> *mut c_char {
 }
 
 fn command_inner(cmd_json: &str) -> Result<String> {
-    let b = bridge().get().ok_or_else(|| anyhow!("mesh not started"))?;
+    let b = bridge().ok_or_else(|| anyhow!("mesh not started"))?;
     let dto: CommandDto = serde_json::from_str(cmd_json)?;
     let command = to_command(dto)?;
     let reply = b.runtime.block_on(b.handle.call(command))?;
@@ -231,7 +264,7 @@ fn to_command(d: CommandDto) -> Result<Command> {
 /// isolate or another native thread.
 #[no_mangle]
 pub extern "C" fn mesh_poll_event(timeout_ms: u64) -> *mut c_char {
-    let Some(b) = bridge().get() else {
+    let Some(b) = bridge() else {
         return std::ptr::null_mut();
     };
     let Ok(mut rx) = b.events.lock() else {
@@ -267,4 +300,110 @@ pub extern "C" fn mesh_status_table() -> *mut c_char {
         })
         .collect();
     out(serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into()))
+}
+
+// ------------------------------------------------------------------ ble radio
+
+/// Frames the platform's Bluetooth layer must transmit, drained in one call.
+///
+/// Returns a JSON array: `[{"frame":"<hex>","to":"<device id>"|null}, ...]`, where a null
+/// `to` means "advertise/write to every connected peer". Empty array when there is
+/// nothing to send, and `[]` too when the node is not on the BLE transport.
+///
+/// Draining in a batch rather than one at a time keeps the FFI chatter down: a node
+/// beacons every three seconds but a burst of relayed traffic can queue many at once.
+#[no_mangle]
+pub extern "C" fn mesh_ble_drain() -> *mut c_char {
+    let Some(b) = bridge() else {
+        return out("[]".into());
+    };
+    let Some(ble) = b.ble.as_ref() else {
+        return out("[]".into());
+    };
+    let mut items = Vec::new();
+    // Bounded so one call cannot block the UI thread for an unbounded time.
+    while items.len() < 64 {
+        match ble.take_outbound() {
+            Some(o) => items.push(serde_json::json!({
+                "frame": hex::encode(&o.frame),
+                "to": o.to,
+            })),
+            None => break,
+        }
+    }
+    out(serde_json::to_string(&items).unwrap_or_else(|_| "[]".into()))
+}
+
+/// Hand the core a frame that arrived over Bluetooth.
+///
+/// Input: `{"frame":"<hex>","from":"<device id>"}`. The device id is whatever the
+/// platform uses to name a peer - an Android MAC, an iOS peripheral UUID. It is opaque
+/// here; the core only needs it to be stable for the life of a connection.
+///
+/// # Safety
+/// `json` must be a valid NUL-terminated UTF-8 C string.
+#[no_mangle]
+pub unsafe extern "C" fn mesh_ble_inject(json: *const c_char) -> *mut c_char {
+    let text = match as_str(json) {
+        Ok(t) => t,
+        Err(e) => return err_json(e),
+    };
+    match inject_inner(text) {
+        Ok(()) => out(r#"{"type":"ok","message":"injected"}"#.into()),
+        Err(e) => err_json(e),
+    }
+}
+
+fn inject_inner(json: &str) -> Result<()> {
+    let b = bridge().ok_or_else(|| anyhow!("mesh not started"))?;
+    let ble = b
+        .ble
+        .as_ref()
+        .ok_or_else(|| anyhow!("node is not running on the ble transport"))?;
+    let value: serde_json::Value = serde_json::from_str(json)?;
+    let frame_hex = value["frame"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing 'frame'"))?;
+    let from = value["from"].as_str().ok_or_else(|| anyhow!("missing 'from'"))?;
+    let frame = hex::decode(frame_hex)?;
+    ble.inject(frame, from)
+}
+
+/// A Bluetooth peer disconnected; drop its link mapping so a reconnection starts clean.
+///
+/// # Safety
+/// `device` must be a valid NUL-terminated UTF-8 C string.
+#[no_mangle]
+pub unsafe extern "C" fn mesh_ble_peer_lost(device: *const c_char) {
+    let Ok(text) = as_str(device) else { return };
+    if let Some(b) = bridge() {
+        if let Some(ble) = b.ble.as_ref() {
+            ble.peer_lost(text);
+        }
+    }
+}
+
+/// Stop the running node and release its port or radio.
+///
+/// Needed to switch transport without killing the app. Returns true if a node was
+/// actually stopped. The tokio runtime is shut down in the background because dropping
+/// it inline would block on in-flight tasks, and this is called from the UI thread.
+#[no_mangle]
+pub extern "C" fn mesh_stop() -> bool {
+    let taken = match bridge_slot().write() {
+        Ok(mut slot) => slot.take(),
+        Err(_) => return false,
+    };
+    match taken {
+        Some(b) => {
+            match Arc::try_unwrap(b) {
+                Ok(owned) => owned.runtime.shutdown_background(),
+                // Another thread is mid-call; dropping our reference is enough, and the
+                // node dies with the last one.
+                Err(_) => {}
+            }
+            true
+        }
+        None => false,
+    }
 }

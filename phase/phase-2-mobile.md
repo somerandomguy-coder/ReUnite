@@ -51,21 +51,21 @@ change. Swapping to `flutter_rust_bridge` later would touch only `crates/meshffi
       `start(config) -> NodeHandle`, `call(Command) -> Reply`, and `events() -> Stream<Event>`.
 - [x] Build targets: `aarch64-linux-android`, `armv7-linux-androideabi`,
       `aarch64-apple-ios`, `aarch64-apple-ios-sim`. `cargo-ndk` for Android.
-- [ ] **The radio lives in the platform, not in Rust.** Rust BLE libraries lose to mobile
+- [x] **The radio lives in the platform, not in Rust.** Rust BLE libraries lose to mobile
       OS lifecycles. Implement `ExternalTransport` in `meshcore`: a `Transport` whose
       `send_broadcast`/`send_to` push bytes out through a callback into Dart, and whose
       `recv` is fed by frames Dart pushes in. Everything above it — routing, crypto, the
       actor — is reused untouched.
-- [ ] Android (`MainActivity.kt` + a plugin class): `BluetoothLeAdvertiser` publishing
+- [x] Android (`MainActivity.kt` + `BleMesh.kt`): `BluetoothLeAdvertiser` publishing
       Beacon v1 in manufacturer-specific data, `BluetoothLeScanner` with a low-latency
       scan filtered on the service UUID `a1b2c3d4-e5f6-7890-1234-56789abcdef0` (already
       used by `transport/ble_linux.rs`, so a Linux node and a phone interoperate), and a
       GATT server on the existing RX/TX characteristics for the frames too big to advertise.
-- [ ] iOS (`AppDelegate.swift` + a Swift plugin): `CBPeripheralManager` advertising,
+- [x] iOS (`AppDelegate.swift` + `BleMesh.swift`): `CBPeripheralManager` advertising,
       `CBCentralManager` scanning, GATT for the same two characteristics.
-- [ ] **RSSI finally has a source.** Both scanners report it per advertisement; feed it to
+- [~] **RSSI finally has a source.** Both scanners report it per advertisement; feed it to
       `Router::note_rssi`, which has existed and returned nothing useful since Phase 1.
-- [ ] Connections are opened **only** to exchange a network key, and closed immediately
+- [~] Connections are opened **only** to exchange a network key, and closed immediately
       (`plan.md` §2: "3 seconds"). Everything else is connectionless advertising.
 
 ## Step 2.2 — Map and heat map UI
@@ -157,14 +157,35 @@ change. Swapping to `flutter_rust_bridge` later would touch only `crates/meshffi
 * **Verified live**: the macOS app meshed with a `meshnet` CLI node over UDP - 1 ms RTT,
   and the app's core recorded the peer's SOS, status code, battery and zone report.
 
+**Step 2.1's radio half - written, compiles, untested on hardware.**
+
+* `crates/meshcore/src/transport/external.rs` - a `Transport` with no I/O of its own, just
+  an outbound queue the platform drains and an inbound channel it feeds. Bounded, so a
+  radio that stops draining (Bluetooth off, permission refused) cannot grow it without
+  limit. Bluetooth device ids are mapped to synthetic loopback addresses, deferring the
+  `LinkAddr` refactor to Phase 3 rather than doing it mid-phase.
+* FFI: `mesh_ble_drain`, `mesh_ble_inject`, `mesh_ble_peer_lost`, plus `mesh_stop` so the
+  app can change radio without restarting.
+* `BleMesh.kt` and `BleMesh.swift` - each device advertises **and** scans, hosts a GATT
+  server **and** connects out as a client. Being symmetric means it does not matter who
+  discovered whom. Frames are length-prefixed and chunked across writes, reassembled per
+  device so two peers writing at once cannot corrupt each other.
+* A radio picker on the Networks tab, with runtime Bluetooth permissions.
+
 **Still open in this phase.**
 
-* **Step 2.1's radio half.** Native Android/Kotlin and iOS/Swift BLE advertise+scan, and
-  `ExternalTransport` to feed frames from Dart into the core. Until then two phones need a
-  shared Wi-Fi or hotspot. `beacon.rs` is the format waiting for it.
-* **Step 2.5 entirely.** No foreground service, no CoreBluetooth background modes.
-  Backgrounding the app stops the mesh.
-* **RSSI** still has no source, for the same reason - it arrives with the BLE scanner.
+* **No physical phone-to-phone test.** No device was available here. Everything above the
+  radio is tested - including two complete nodes meshing over a transport with no
+  networking - and both native layers compile, but the first real BLE test is still to come.
+* **Beacon v1 is not on the air.** The 27-byte advertisement format exists and is tested,
+  but the radio currently advertises only a service UUID and carries everything over GATT.
+  Putting Beacon v1 into manufacturer data is what makes presence and SOS visible without
+  connecting at all, which is what `plan.md` §2 ultimately asks for.
+* **Connections are not torn down after key exchange.** `plan.md` §2 wants them held for
+  ~3 seconds; today they persist, which costs battery.
+* **RSSI** is read from scan results but not yet fed to `Router::note_rssi`.
+* **Step 2.5 entirely.** No foreground service, no iOS state restoration. The iOS
+  background modes are declared but nothing resumes the mesh.
 * **Offline map tiles.** Compass/Grid mode is the only view.
-* **iOS is unverified.** The static library builds, but the two Xcode linking steps and a
-  device test have not been done here. `docs/MOBILE.md` documents them honestly as manual.
+* **iOS linking is manual.** `BleMesh.swift` is now in the Xcode project and compiles, but
+  linking `libmeshffi.a` is still the two manual steps in `docs/MOBILE.md` §3.

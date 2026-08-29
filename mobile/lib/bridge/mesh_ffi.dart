@@ -18,6 +18,12 @@ typedef _FreeNative = Void Function(Pointer<Utf8>);
 typedef _FreeDart = void Function(Pointer<Utf8>);
 typedef _TableNative = Pointer<Utf8> Function();
 typedef _TableDart = Pointer<Utf8> Function();
+typedef _DrainNative = Pointer<Utf8> Function();
+typedef _DrainDart = Pointer<Utf8> Function();
+typedef _LostNative = Void Function(Pointer<Utf8>);
+typedef _LostDart = void Function(Pointer<Utf8>);
+typedef _StopNative = Bool Function();
+typedef _StopDart = bool Function();
 
 class MeshFfiException implements Exception {
   final String message;
@@ -35,6 +41,10 @@ class MeshFfi {
   late final _PollDart _poll;
   late final _FreeDart _free;
   late final _TableDart _table;
+  late final _DrainDart _bleDrain;
+  late final _CommandDart _bleInject;
+  late final _LostDart _blePeerLost;
+  late final _StopDart _stop;
 
   MeshFfi._(this._lib) {
     _start = _lib.lookupFunction<_StartNative, _StartDart>('mesh_start');
@@ -42,6 +52,10 @@ class MeshFfi {
     _poll = _lib.lookupFunction<_PollNative, _PollDart>('mesh_poll_event');
     _free = _lib.lookupFunction<_FreeNative, _FreeDart>('mesh_free');
     _table = _lib.lookupFunction<_TableNative, _TableDart>('mesh_status_table');
+    _bleDrain = _lib.lookupFunction<_DrainNative, _DrainDart>('mesh_ble_drain');
+    _bleInject = _lib.lookupFunction<_CommandNative, _CommandDart>('mesh_ble_inject');
+    _blePeerLost = _lib.lookupFunction<_LostNative, _LostDart>('mesh_ble_peer_lost');
+    _stop = _lib.lookupFunction<_StopNative, _StopDart>('mesh_stop');
   }
 
   static MeshFfi get instance => _instance ??= MeshFfi._(_open());
@@ -136,4 +150,38 @@ class MeshFfi {
     if (text.isEmpty) return const [];
     return (jsonDecode(text) as List).cast<Map<String, dynamic>>();
   }
+
+  // --------------------------------------------------------------- ble radio
+
+  /// Frames the core wants transmitted. Each is `{frame: hex, to: deviceId?}`, where a
+  /// null `to` means "everyone in range". Empty when the node is not on the BLE
+  /// transport, so calling this unconditionally is safe.
+  List<Map<String, dynamic>> bleDrain() {
+    final text = _consume(_bleDrain());
+    if (text.isEmpty) return const [];
+    return (jsonDecode(text) as List).cast<Map<String, dynamic>>();
+  }
+
+  /// Hand the core a frame that arrived over Bluetooth.
+  Map<String, dynamic> bleInject(String frameHex, String fromDevice) {
+    final input = jsonEncode({'frame': frameHex, 'from': fromDevice}).toNativeUtf8();
+    try {
+      return _json(_consume(_bleInject(input)));
+    } finally {
+      calloc.free(input);
+    }
+  }
+
+  /// A Bluetooth peer disconnected, so its link mapping should be dropped.
+  void blePeerLost(String device) {
+    final input = device.toNativeUtf8();
+    try {
+      _blePeerLost(input);
+    } finally {
+      calloc.free(input);
+    }
+  }
+
+  /// Stop the node and release its port or radio. True if one was running.
+  bool stop() => _stop();
 }

@@ -19,6 +19,10 @@
     <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
+    <!-- The mesh needs BLE. Marked not-required so the app still installs and runs over
+         Wi-Fi on a device without it. -->
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
+
     <application
         android:label="ReUnite"
         android:name="${applicationName}"

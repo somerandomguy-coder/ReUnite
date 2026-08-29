@@ -763,6 +763,7 @@ name = "meshffi"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hex",
  "meshcore",
  "serde",
  "serde_json",

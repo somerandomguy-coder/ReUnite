@@ -8,7 +8,10 @@
 
 use std::ffi::{CStr, CString};
 
-use meshffi::{mesh_command, mesh_free, mesh_poll_event, mesh_start, mesh_status_table};
+use meshffi::{
+    mesh_ble_drain, mesh_ble_inject, mesh_ble_peer_lost, mesh_command, mesh_free,
+    mesh_poll_event, mesh_start, mesh_status_table, mesh_stop,
+};
 
 fn call(f: unsafe extern "C" fn(*const std::ffi::c_char) -> *mut std::ffi::c_char, json: &str) -> serde_json::Value {
     let input = CString::new(json).unwrap();
@@ -108,6 +111,80 @@ fn the_bridge_starts_a_node_and_answers_every_ui_command() {
         seen.iter().any(|t| t == "context"),
         "expected a context event from --create-network, saw {seen:?}"
     );
+
+    // ---- the Bluetooth transport ----
+    // Switching radio means stopping one node and starting another in this process,
+    // which is exactly what the app does when the user changes transport.
+    assert!(mesh_stop(), "a node was running and should have stopped");
+    assert_eq!(
+        call(mesh_command, r#"{"cmd":"peers"}"#)["type"],
+        "error",
+        "commands must fail cleanly once the node is stopped"
+    );
+
+    let ble_home = std::env::temp_dir().join(format!("meshffi-ble-{}", std::process::id()));
+    let ble_config = serde_json::json!({
+        "home": ble_home.to_string_lossy(),
+        "name": "phone-ble",
+        "transport": "ble",
+        "battery": 33u8,
+    });
+    let started = call(mesh_start, &ble_config.to_string());
+    assert_eq!(started["type"], "whoami");
+    assert!(
+        started["whoami"]["transport"]
+            .as_str()
+            .unwrap()
+            .contains("ble"),
+        "transport should report the radio, got {}",
+        started["whoami"]["transport"]
+    );
+
+    // The node beacons whether or not a radio is listening, so frames queue up for the
+    // platform to collect. That queue is the whole contract with Kotlin and Swift.
+    let mut queued: Vec<serde_json::Value> = Vec::new();
+    for _ in 0..40 {
+        let batch = unsafe {
+            let raw = mesh_ble_drain();
+            let text = CStr::from_ptr(raw).to_str().unwrap().to_owned();
+            mesh_free(raw);
+            serde_json::from_str::<Vec<serde_json::Value>>(&text).unwrap()
+        };
+        queued.extend(batch);
+        if !queued.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(!queued.is_empty(), "the node should have queued a beacon for the radio");
+    let first = &queued[0];
+    assert!(first["to"].is_null(), "a beacon is a broadcast, so it names no device");
+    let frame_hex = first["frame"].as_str().unwrap();
+    assert!(!frame_hex.is_empty() && frame_hex.len() % 2 == 0, "frame is hex");
+
+    // Feeding a frame back in is what the Kotlin/Swift layer does on every BLE receive.
+    // Our own frame is rejected upstream as a self-echo, which is correct: the point
+    // here is that the inject path accepts and parses it without error.
+    let injected = call(
+        mesh_ble_inject,
+        &serde_json::json!({"frame": frame_hex, "from": "AA:BB:CC:DD:EE:FF"}).to_string(),
+    );
+    assert_eq!(injected["type"], "ok");
+
+    // Malformed input is an error, never a crash across the boundary.
+    assert_eq!(
+        call(mesh_ble_inject, r#"{"frame":"zzzz","from":"x"}"#)["type"],
+        "error"
+    );
+    assert_eq!(call(mesh_ble_inject, r#"{"from":"x"}"#)["type"], "error");
+
+    unsafe {
+        let device = CString::new("AA:BB:CC:DD:EE:FF").unwrap();
+        mesh_ble_peer_lost(device.as_ptr());
+    }
+
+    assert!(mesh_stop());
+    assert!(!mesh_stop(), "stopping twice is a no-op, not a crash");
 }
 
 #[test]
@@ -132,4 +209,3 @@ fn polling_with_no_node_running_returns_null_instead_of_crashing() {
         unsafe { mesh_free(raw) };
     }
 }
-

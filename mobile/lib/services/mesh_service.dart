@@ -5,8 +5,21 @@ import 'package:flutter/foundation.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:path_provider/path_provider.dart';
 
+import 'package:permission_handler/permission_handler.dart';
+
+import '../bridge/ble_radio.dart';
 import '../bridge/mesh_ffi.dart';
 import '../models/mesh_models.dart';
+
+/// Which radio the mesh is running on.
+enum MeshTransport {
+  /// UDP over Wi-Fi. Works laptop-to-laptop and phone-to-phone, but needs a shared
+  /// network or hotspot.
+  wifi,
+
+  /// Bluetooth Low Energy via the native plugin. Needs no infrastructure at all.
+  bluetooth,
+}
 
 /// The app's single connection to the mesh.
 ///
@@ -17,10 +30,18 @@ import '../models/mesh_models.dart';
 /// about the mesh belongs in `crates/meshcore`.
 class MeshService extends ChangeNotifier {
   final MeshFfi _ffi;
-  MeshService({MeshFfi? ffi}) : _ffi = ffi ?? MeshFfi.instance;
+  final BleRadio _ble;
+  MeshService({MeshFfi? ffi, BleRadio? ble})
+      : _ffi = ffi ?? MeshFfi.instance,
+        _ble = ble ?? BleRadio();
 
   Timer? _eventTimer;
   Timer? _refreshTimer;
+  Timer? _bleTimer;
+  StreamSubscription<Map<String, dynamic>>? _bleEvents;
+  MeshTransport _transport = MeshTransport.wifi;
+  int _bleConnected = 0;
+  String? _bleError;
 
   bool _started = false;
   String? _startError;
@@ -33,6 +54,13 @@ class MeshService extends ChangeNotifier {
 
   bool get started => _started;
   String? get startError => _startError;
+  MeshTransport get transport => _transport;
+  bool get bluetoothAvailable => BleRadio.isAvailable;
+
+  /// Peers the radio can actually reach right now. Zero on Bluetooth means nothing is
+  /// connected yet, which is the single most useful thing to show while someone waits.
+  int get bleConnected => _bleConnected;
+  String? get bleError => _bleError;
   Whoami? get me => _me;
   String get nodeId => _me?.id ?? '...';
   String get activeNetwork => _me?.network ?? 'default';
@@ -62,9 +90,19 @@ class MeshService extends ChangeNotifier {
     bool? multicast,
     bool broadcast = true,
     String? name,
+    MeshTransport transport = MeshTransport.wifi,
   }) async {
     if (_started) return;
+    _transport = transport;
     try {
+      if (transport == MeshTransport.bluetooth) {
+        final denied = await _requestBluetoothPermissions();
+        if (denied != null) {
+          _startError = denied;
+          notifyListeners();
+          return;
+        }
+      }
       final String homePath;
       if (homeOverride != null) {
         homePath = homeOverride;
@@ -77,6 +115,7 @@ class MeshService extends ChangeNotifier {
 
       final reply = _ffi.start({
         'home': home.path,
+        'transport': transport == MeshTransport.bluetooth ? 'ble' : 'udp',
         'name': name ?? _defaultName(),
         'port': port,
         'peers': peers,
@@ -100,6 +139,7 @@ class MeshService extends ChangeNotifier {
       // blocked waiting for a beacon that may be three seconds away.
       _eventTimer = Timer.periodic(const Duration(milliseconds: 200), (_) => _drainEvents());
       _refreshTimer = Timer.periodic(const Duration(seconds: 3), (_) => refresh());
+      if (transport == MeshTransport.bluetooth) await _startBluetooth();
       refresh();
     } catch (e) {
       _startError = '$e';
@@ -118,7 +158,104 @@ class MeshService extends ChangeNotifier {
   void dispose() {
     _eventTimer?.cancel();
     _refreshTimer?.cancel();
+    _bleTimer?.cancel();
+    _bleEvents?.cancel();
     super.dispose();
+  }
+
+  /// Stop the node and start it again on the other radio.
+  ///
+  /// The identity, contacts, networks and zones all live on disk, so nothing is lost:
+  /// the same node comes back on a different transport.
+  Future<void> switchTransport(MeshTransport to) async {
+    if (to == _transport && _started) return;
+    _bleTimer?.cancel();
+    await _bleEvents?.cancel();
+    _bleEvents = null;
+    await _ble.stop();
+    _eventTimer?.cancel();
+    _refreshTimer?.cancel();
+    _ffi.stop();
+    _started = false;
+    _startError = null;
+    _bleError = null;
+    _bleConnected = 0;
+    _peers = const [];
+    notifyListeners();
+    await init(transport: to);
+  }
+
+  // ------------------------------------------------------------------ bluetooth
+
+  /// Android 12+ gates scanning, advertising and connecting behind separate runtime
+  /// permissions, and refuses silently without them.
+  Future<String?> _requestBluetoothPermissions() async {
+    if (!Platform.isAndroid && !Platform.isIOS) {
+      return 'Bluetooth mesh is only available on Android and iOS';
+    }
+    try {
+      final wanted = Platform.isAndroid
+          ? [Permission.bluetoothScan, Permission.bluetoothAdvertise, Permission.bluetoothConnect]
+          : [Permission.bluetooth];
+      final results = await wanted.request();
+      final refused = results.entries.where((e) => !e.value.isGranted).map((e) => e.key);
+      if (refused.isNotEmpty) {
+        return 'Bluetooth permission was refused (${refused.map((p) => p.toString().split('.').last).join(', ')}). '
+            'The mesh cannot see other phones without it.';
+      }
+      return null;
+    } catch (e) {
+      return 'could not request Bluetooth permission: $e';
+    }
+  }
+
+  Future<void> _startBluetooth() async {
+    if (!await _ble.isSupported()) {
+      _bleError = 'this device has no Bluetooth LE radio';
+      return;
+    }
+    if (!await _ble.isEnabled()) {
+      _bleError = 'Bluetooth is turned off - switch it on to reach other phones';
+      return;
+    }
+    final err = await _ble.start();
+    if (err != null) {
+      _bleError = err;
+      return;
+    }
+    _bleError = null;
+
+    // Frames arriving off the air go straight into the core.
+    _bleEvents = _ble.events().listen((event) {
+      switch (event['type'] as String?) {
+        case 'frame':
+          _ffi.bleInject(event['frame'] as String, event['from'] as String);
+          break;
+        case 'peer_lost':
+          _ffi.blePeerLost(event['device'] as String);
+          break;
+        case 'log':
+          debugPrint('BLE: ${event['message']}');
+          break;
+      }
+    }, onError: (Object e) => debugPrint('BLE event stream error: $e'));
+
+    // ...and frames the core wants sent go out to the radio. 100ms keeps beacons
+    // punctual without waking the radio pointlessly.
+    _bleTimer = Timer.periodic(const Duration(milliseconds: 100), (_) => _pumpBluetooth());
+  }
+
+  Future<void> _pumpBluetooth() async {
+    if (!_started) return;
+    final pending = _ffi.bleDrain();
+    for (final item in pending) {
+      await _ble.send(item['frame'] as String, item['to'] as String?);
+    }
+    final connected = await _ble.connectedCount();
+    if (connected != _bleConnected) {
+      _bleConnected = connected;
+      notifyListeners();
+    }
   }
 
   // -------------------------------------------------------------------- plumbing

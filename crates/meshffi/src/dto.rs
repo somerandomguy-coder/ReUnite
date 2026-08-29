@@ -368,6 +368,9 @@ impl From<Event> for EventDto {
 #[derive(Deserialize)]
 pub struct StartConfig {
     pub home: String,
+    /// `"udp"` (Wi-Fi) or `"ble"` (frames handed to the platform's Bluetooth layer).
+    #[serde(default = "default_transport")]
+    pub transport: String,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default = "default_port")]
@@ -386,6 +389,9 @@ pub struct StartConfig {
 
 fn default_port() -> u16 {
     47474
+}
+fn default_transport() -> String {
+    "udp".to_string()
 }
 fn default_true() -> bool {
     true

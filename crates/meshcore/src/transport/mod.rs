@@ -5,7 +5,11 @@
 //! mesh over any shared Wi-Fi link (a router with no internet, a phone hotspot, or a
 //! laptop-hosted ad-hoc network). Phase 2's BLE / Wi-Fi Direct adapters implement this
 //! same trait and drop in underneath the identical routing, crypto and CLI code.
+//!
+//! `external` is how the mobile app does that: the radio lives in Kotlin or Swift, and
+//! frames cross the FFI boundary in both directions.
 
+pub mod external;
 pub mod udp;
 
 #[cfg(target_os = "linux")]
@@ -16,6 +20,7 @@ use std::net::SocketAddr;
 use anyhow::Result;
 use async_trait::async_trait;
 
+pub use external::{ExternalTransport, Outbound};
 pub use udp::{UdpConfig, UdpTransport};
 
 #[cfg(target_os = "linux")]
