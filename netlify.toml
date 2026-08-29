@@ -2,3 +2,7 @@
   base = "web"
   command = "node build.js"
   publish = "."
+
+[build.environment]
+  SECRETS_SCAN_OMIT_KEYS = "YOUR_GOOGLE_MAPS_API_KEY,GOOGLE_MAPS_API_KEY"
+  SECRETS_SCAN_OMIT_PATHS = "assets/js/config.js,web/assets/js/config.js"
