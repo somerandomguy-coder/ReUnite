@@ -244,3 +244,96 @@ pub fn read_messages(home: &Path, network: &NetworkId, limit: usize) -> Result<V
     }
     Ok(all)
 }
+
+// ------------------------------------------------------------- SQL Schema Export
+
+/// Official SQL DDL Schema for SQLite / mobile offline database synchronization
+pub const REUNITE_SQL_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS contacts (
+    id TEXT PRIMARY KEY NOT NULL,
+    ed_pub TEXT NOT NULL,
+    x_pub TEXT NOT NULL,
+    alias TEXT,
+    self_name TEXT,
+    last_seen_ms INTEGER NOT NULL,
+    lat REAL,
+    lon REAL,
+    battery INTEGER,
+    status INTEGER,
+    sos INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id TEXT PRIMARY KEY NOT NULL,
+    network TEXT NOT NULL,
+    network_name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    from_id TEXT NOT NULL,
+    from_name TEXT NOT NULL,
+    to_id TEXT,
+    text TEXT NOT NULL,
+    lat REAL,
+    lon REAL,
+    hops INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'delivered',
+    ts_ms INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS networks (
+    id TEXT PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL,
+    creator TEXT NOT NULL,
+    epoch INTEGER NOT NULL DEFAULT 1,
+    key_hex TEXT NOT NULL,
+    members_json TEXT NOT NULL,
+    store_messages INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS safe_zones (
+    cell_id INTEGER PRIMARY KEY NOT NULL,
+    level INTEGER NOT NULL,
+    consensus_count INTEGER NOT NULL DEFAULT 1,
+    last_reporter TEXT NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+);
+"#;
+
+/// High-level Database & Persistence Manager for ReUnite
+pub struct DatabaseStore {
+    pub home: PathBuf,
+}
+
+impl DatabaseStore {
+    pub fn new(home: PathBuf) -> Result<Self> {
+        let home_path = resolve_home(Some(home))?;
+        Ok(Self { home: home_path })
+    }
+
+    pub fn sql_schema(&self) -> &'static str {
+        REUNITE_SQL_SCHEMA
+    }
+
+    pub fn load_contacts(&self) -> Result<HashMap<NodeId, Contact>> {
+        load_contacts(&self.home)
+    }
+
+    pub fn save_contacts(&self, contacts: &HashMap<NodeId, Contact>) -> Result<()> {
+        save_contacts(&self.home, contacts)
+    }
+
+    pub fn load_networks(&self) -> Result<NetworksFile> {
+        load_networks(&self.home)
+    }
+
+    pub fn save_networks(&self, file: &NetworksFile) -> Result<()> {
+        save_networks(&self.home, file)
+    }
+
+    pub fn append_msg(&self, network: &NetworkId, msg: &StoredMessage) -> Result<()> {
+        append_message(&self.home, network, msg)
+    }
+
+    pub fn get_messages(&self, network: &NetworkId, limit: usize) -> Result<Vec<StoredMessage>> {
+        read_messages(&self.home, network, limit)
+    }
+}
