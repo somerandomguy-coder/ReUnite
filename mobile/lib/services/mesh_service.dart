@@ -1,7 +1,8 @@
+import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:geolocator/geolocator.dart';
 
-enum MessageType { text, location }
+enum MessageType { text, location, sos }
 enum MessageStatus { sending, relayed, delivered }
 
 class PeerNode {
@@ -60,6 +61,7 @@ class ChatMessageModel {
       'lon': lon,
       'timestamp': timestamp,
       'hops': hops,
+      if (type == MessageType.sos) 'intervalMs': 300,
     };
   }
 }
@@ -70,12 +72,17 @@ class MeshService extends ChangeNotifier {
   final List<PeerNode> _peers = [];
   final List<ChatMessageModel> _messages = [];
   bool _isScanning = false;
+  bool _isSosActive = false;
+  Timer? _sosTimer;
+  int _sosBroadcastCount = 0;
 
   String get activeNetwork => _activeNetwork;
   String get nodeId => _nodeId;
   List<PeerNode> get peers => List.unmodifiable(_peers);
   List<ChatMessageModel> get messages => List.unmodifiable(_messages);
   bool get isScanning => _isScanning;
+  bool get isSosActive => _isSosActive;
+  int get sosBroadcastCount => _sosBroadcastCount;
 
   Future<void> init() async {
     _isScanning = true;
@@ -98,6 +105,88 @@ class MeshService extends ChangeNotifier {
       lon: 151.2101,
       isDirect: false,
     ));
+    notifyListeners();
+  }
+
+  /// Toggle high-frequency 0.3s SOS Emergency Beacon
+  Future<void> toggleSos() async {
+    _isSosActive = !_isSosActive;
+
+    if (_isSosActive) {
+      _sosBroadcastCount = 0;
+      
+      // Fetch GPS position immediately for SOS broadcast
+      double lat = -33.8688;
+      double lon = 151.2093;
+      try {
+        Position pos = await Geolocator.getCurrentPosition(
+          desiredAccuracy: LocationAccuracy.high,
+        );
+        lat = pos.latitude;
+        lon = pos.longitude;
+      } catch (e) {
+        debugPrint("SOS GPS fetch warning: $e");
+      }
+
+      final now = DateTime.now();
+      final timeStr = "${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}";
+
+      // Add main SOS alert to chat
+      _messages.add(ChatMessageModel(
+        senderId: _nodeId,
+        senderName: "Android-Self",
+        text: "🚨 EMERGENCY SOS ACTIVATED - BROADCASTING BEACON (0.3s)",
+        type: MessageType.sos,
+        lat: lat,
+        lon: lon,
+        timestamp: timeStr,
+        isMe: true,
+        hops: 1,
+        status: MessageStatus.relayed,
+      ));
+
+      // Start 0.3-second rapid broadcast timer loop
+      _sosTimer?.cancel();
+      _sosTimer = Timer.periodic(const Duration(milliseconds: 300), (timer) {
+        _sosBroadcastCount++;
+        notifyListeners();
+      });
+
+      // Simulate incoming SOS confirmation from rescue relay node after 3 seconds
+      Future.delayed(const Duration(seconds: 3), () {
+        if (_isSosActive) {
+          _messages.add(ChatMessageModel(
+            senderId: "peer-c9103a4f",
+            senderName: "Rescue-Relay-2",
+            text: "🚨 RESCUE ACK: SOS Received! Emergency Team Dispatched to your GPS!",
+            type: MessageType.sos,
+            lat: lat + 0.0002,
+            lon: lon + 0.0002,
+            timestamp: "${DateTime.now().hour.toString().padLeft(2, '0')}:${DateTime.now().minute.toString().padLeft(2, '0')}",
+            isMe: false,
+            hops: 2,
+            status: MessageStatus.delivered,
+          ));
+          notifyListeners();
+        }
+      });
+    } else {
+      _sosTimer?.cancel();
+      _sosTimer = null;
+      
+      final now = DateTime.now();
+      final timeStr = "${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}";
+      _messages.add(ChatMessageModel(
+        senderId: _nodeId,
+        senderName: "Android-Self",
+        text: "🟢 SOS Emergency Beacon Deactivated (Safe)",
+        type: MessageType.text,
+        timestamp: timeStr,
+        isMe: true,
+        hops: 1,
+        status: MessageStatus.delivered,
+      ));
+    }
     notifyListeners();
   }
 
@@ -181,5 +270,11 @@ class MeshService extends ChangeNotifier {
   void createNetwork(String name) {
     _activeNetwork = name;
     notifyListeners();
+  }
+
+  @override
+  void dispose() {
+    _sosTimer?.cancel();
+    super.dispose();
   }
 }

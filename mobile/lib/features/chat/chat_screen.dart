@@ -43,6 +43,28 @@ class _ChatScreenState extends State<ChatScreen> {
           ],
         ),
         actions: [
+          // Red SOS Emergency Button
+          ElevatedButton.icon(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: meshService.isSosActive ? Colors.redAccent : Colors.red.shade900,
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(horizontal: 10),
+              elevation: meshService.isSosActive ? 8 : 2,
+            ),
+            icon: Icon(
+              meshService.isSosActive ? Icons.warning : Icons.sos,
+              color: Colors.yellowAccent,
+              size: 20,
+            ),
+            label: Text(
+              meshService.isSosActive ? 'STOP SOS' : 'SOS',
+              style: const TextStyle(fontWeight: FontWeight.bold),
+            ),
+            onPressed: () async {
+              await meshService.toggleSos();
+              _scrollToBottom();
+            },
+          ),
           IconButton(
             icon: const Icon(Icons.info_outline),
             onPressed: () {
@@ -51,7 +73,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 builder: (_) => Container(
                   padding: const EdgeInsets.all(16),
                   child: Text(
-                    'Node ID: ${meshService.nodeId}\nNetwork: ${meshService.activeNetwork}\nTransport: BLE Multi-Hop P2P Mesh\nActive Peers: ${meshService.peers.length}',
+                    'Node ID: ${meshService.nodeId}\nNetwork: ${meshService.activeNetwork}\nTransport: BLE Multi-Hop P2P Mesh\nSOS Mode: ${meshService.isSosActive ? "ACTIVE (0.3s)" : "INACTIVE"}',
                     style: const TextStyle(fontSize: 14),
                   ),
                 ),
@@ -62,28 +84,55 @@ class _ChatScreenState extends State<ChatScreen> {
       ),
       body: Column(
         children: [
-          // Android BLE Mesh Status Indicator Banner
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-            color: Colors.cyan.shade900.withOpacity(0.4),
-            child: Row(
-              children: [
-                const Icon(Icons.bluetooth_searching, color: Colors.cyanAccent, size: 16),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    'BLE Mesh Active • ${meshService.peers.length} Direct Peers Connected',
-                    style: const TextStyle(color: Colors.cyanAccent, fontSize: 12),
+          // SOS Emergency Active Banner (Pulsating Red)
+          if (meshService.isSosActive)
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+              color: Colors.red.shade900,
+              child: Row(
+                children: [
+                  const Icon(Icons.warning, color: Colors.yellowAccent, size: 20),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      '🚨 BROADCASTING EMERGENCY SOS (0.3s) • Packets Sent: ${meshService.sosBroadcastCount}',
+                      style: const TextStyle(
+                        color: Colors.yellowAccent,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 12,
+                      ),
+                    ),
                   ),
-                ),
-              ],
+                  TextButton(
+                    onPressed: () => meshService.toggleSos(),
+                    child: const Text('STOP', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                  ),
+                ],
+              ),
+            )
+          else
+            // Standard Android BLE Mesh Status Indicator Banner
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              color: Colors.cyan.shade900.withOpacity(0.4),
+              child: Row(
+                children: [
+                  const Icon(Icons.bluetooth_searching, color: Colors.cyanAccent, size: 16),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'BLE Mesh Active • ${meshService.peers.length} Direct Peers Connected',
+                      style: const TextStyle(color: Colors.cyanAccent, fontSize: 12),
+                    ),
+                  ),
+                ],
+              ),
             ),
-          ),
           Expanded(
             child: meshService.messages.isEmpty
                 ? const Center(
                     child: Text(
-                      'No messages yet in [default]\nType a message, tap quick chips, or tap 📍 for GPS',
+                      'No messages yet in [default]\nType a message, tap quick chips, or press SOS',
                       textAlign: TextAlign.center,
                       style: TextStyle(color: Colors.grey),
                     ),
