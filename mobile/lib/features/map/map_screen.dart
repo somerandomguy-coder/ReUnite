@@ -74,22 +74,52 @@ class _InteractiveMapViewState extends State<_InteractiveMapView> {
 
     final markers = <Marker>[];
 
+    final myBattery = widget.me?.battery;
+
     // Current user position marker
     markers.add(
       Marker(
         point: center,
-        width: 50,
-        height: 50,
-        child: const Column(
-          children: [
-            Icon(Icons.person_pin_circle, color: Colors.greenAccent, size: 36),
-            Text("YOU",
-                style: TextStyle(
-                    color: Colors.greenAccent,
-                    fontWeight: FontWeight.bold,
-                    fontSize: 10,
-                    backgroundColor: Colors.black87)),
-          ],
+        width: 70,
+        height: 60,
+        child: Tooltip(
+          message: "YOU ${myBattery != null ? '· 🔋$myBattery%' : ''}",
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.person_pin_circle, color: Colors.greenAccent, size: 34),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                decoration: BoxDecoration(
+                  color: Colors.black87,
+                  borderRadius: BorderRadius.circular(4),
+                  border: Border.all(color: Colors.greenAccent, width: 0.8),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Text("YOU",
+                        style: TextStyle(
+                            color: Colors.greenAccent,
+                            fontWeight: FontWeight.bold,
+                            fontSize: 9)),
+                    if (myBattery != null) ...[
+                      const SizedBox(width: 2),
+                      Icon(
+                        myBattery <= 15 ? Icons.battery_alert : Icons.battery_full,
+                        size: 9,
+                        color: myBattery <= 15 ? Colors.redAccent : Colors.greenAccent,
+                      ),
+                      Text("$myBattery%",
+                          style: TextStyle(
+                              fontSize: 9,
+                              color: myBattery <= 15 ? Colors.redAccent : Colors.white)),
+                    ],
+                  ],
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -98,18 +128,74 @@ class _InteractiveMapViewState extends State<_InteractiveMapView> {
     // area, and drawing it as a point would overstate what the reporter actually said.
     final circles = _zoneCircles(widget.mesh.zones);
 
-    // Add peer position markers
+    // Add peer position markers with battery level display
     for (final p in widget.mesh.peers) {
       if (p.hasPosition) {
+        final isLowBattery = p.battery != null && p.battery! <= 15;
+        final battColor = isLowBattery ? Colors.redAccent : Colors.greenAccent;
         markers.add(
           Marker(
             point: LatLng(p.lat!, p.lon!),
-            width: 40,
-            height: 40,
-            child: Icon(
-              p.sos ? Icons.warning_amber_rounded : Icons.account_circle,
-              color: p.sos ? Colors.redAccent : Colors.cyanAccent,
-              size: 28,
+            width: 80,
+            height: 60,
+            child: Tooltip(
+              message: "${p.display}${p.battery != null ? ' · 🔋${p.battery}%' : ''}${p.sos ? ' · 🚨 SOS EMERGENCY' : ''}",
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    p.sos ? Icons.warning_amber_rounded : Icons.account_circle,
+                    color: p.sos
+                        ? Colors.redAccent
+                        : (p.ghost ? Colors.grey : Colors.cyanAccent),
+                    size: 26,
+                  ),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                    decoration: BoxDecoration(
+                      color: Colors.black87,
+                      borderRadius: BorderRadius.circular(4),
+                      border: Border.all(
+                        color: p.sos
+                            ? Colors.redAccent
+                            : (isLowBattery ? Colors.orangeAccent : Colors.cyanAccent),
+                        width: 0.8,
+                      ),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Flexible(
+                          child: Text(
+                            p.display,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                                color: Colors.white,
+                                fontWeight: FontWeight.bold,
+                                fontSize: 9),
+                          ),
+                        ),
+                        if (p.battery != null) ...[
+                          const SizedBox(width: 2),
+                          Icon(
+                            isLowBattery ? Icons.battery_alert : Icons.battery_full,
+                            size: 9,
+                            color: battColor,
+                          ),
+                          Text(
+                            "${p.battery}%",
+                            style: TextStyle(
+                              fontSize: 9,
+                              fontWeight: FontWeight.w600,
+                              color: battColor,
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
         );
