@@ -28,7 +28,7 @@ The full plan is [`plan.md`](plan.md); it is broken into executable phases in
 | Phase | Scope | Status |
 | :--- | :--- | :--- |
 | [1](phase/phase-1-terminal-mvp.md) | Rust core + terminal MVP | **complete** — see the step table below |
-| [2](phase/phase-2-mobile.md) | iOS/Android app on the real core | not started; `mobile/` is a UI shell over mock data |
+| [2](phase/phase-2-mobile.md) | iOS/Android app on the real core | **in progress** — the app runs on the real core over Wi-Fi; native BLE and background execution are still to do |
 | [3](phase/phase-3-embedded.md) | `no_std` core, ESP32/nRF52, drone relays | not started |
 
 ### Phase 1, step by step
@@ -148,20 +148,33 @@ than vanishing. `SAFETY` is the mean of every node's report for that hex cell; `
 is how many distinct nodes verified it, and is deliberately shown as its own number — one
 person calling a street safe is not the same claim as thirty.
 
-## Mobile
+## Mobile and desktop app
 
-`mobile/` is a Flutter app: three tabs (Chat, GPS & Peers, Networks), dark theme, real GPS
-via `geolocator`, and Android/iOS Bluetooth and location permissions already declared.
+`mobile/` is a Flutter app running **the same mesh core as the CLI** — routing, crypto,
+SOS, panic codes, ghosting and zone consensus all happen in Rust, reached over a small
+C ABI (`crates/meshffi`) through `dart:ffi`.
 
-**It is not yet connected to the mesh.** `lib/services/mesh_service.dart` is mock data — a
-hard-coded node id and one fake peer — and no Rust bridge exists. Wiring it to `meshcore`
-through `flutter_rust_bridge`, with native Kotlin and Swift BLE underneath, is
-[Phase 2](phase/phase-2-mobile.md).
+```bash
+./scripts/build_ffi.sh macos      # or: android | ios
+cd mobile && flutter run -d macos # or a phone from `flutter devices`
+```
+
+Four screens: **Chat**, **Peers** (compass/grid radar with bearing and distance, ghosts,
+battery, SOS), **Emergency** (slide-to-activate SOS, seven one-tap panic buttons, zone
+reporting, heat map with consensus) and **Networks** (create, invite, switch, storing,
+kick).
+
+**Full setup and a step-by-step test script: [docs/MOBILE.md](docs/MOBILE.md).**
+
+Two honest limits today: the app meshes over **Wi-Fi (UDP), not Bluetooth** — the native
+BLE layer is the remaining half of [Phase 2](phase/phase-2-mobile.md) step 2.1 — and it
+does not run in the background yet. Two phones therefore need a shared Wi-Fi or hotspot.
 
 ## Documentation
 
 * [phase/](phase/README.md) — the phase plan, acceptance criteria and deviations register
-* [docs/SETUP.md](docs/SETUP.md) — install, build and run across several computers, step by step
+* [docs/MOBILE.md](docs/MOBILE.md) — run the app on a laptop and on phones, and test every feature
+* [docs/SETUP.md](docs/SETUP.md) — install, build and run the CLI across several computers
 * [docs/DEMO.md](docs/DEMO.md) — a scripted three-laptop demo, including multi-hop relaying
 * [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — protocol, routing, security model and limits
 * [plan.md](plan.md) — the project plan; [proposal.md](proposal.md) — the original scenario
@@ -171,8 +184,10 @@ through `flutter_rust_bridge`, with native Kotlin and Swift BLE underneath, is
 ```
 crates/meshcore   the mesh: identity, crypto, packets, routing, transports, node actor
 crates/meshcli    the terminal client (a thin shell over meshcore)
-mobile/           Flutter app (UI shell; not yet on the real core)
-scripts/          ble_gateway.py — BLE <-> UDP bridge for macOS and Windows
+crates/meshffi    C ABI bridge so the Flutter app runs the same core
+mobile/           Flutter app for macOS, Android and iOS
+scripts/          build_ffi.sh — build the core per platform
+                  ble_gateway.py — BLE <-> UDP bridge for macOS and Windows
 phase/            phase-by-phase build plan
 ```
 

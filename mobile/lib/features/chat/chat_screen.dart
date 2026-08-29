@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+
 import '../../services/mesh_service.dart';
 import 'widgets/message_bubble.dart';
 
@@ -11,89 +12,117 @@ class ChatScreen extends StatefulWidget {
 }
 
 class _ChatScreenState extends State<ChatScreen> {
-  final TextEditingController _textController = TextEditingController();
+  final _controller = TextEditingController();
+  final _scroll = ScrollController();
+
+  void _send(MeshService mesh) {
+    final text = _controller.text;
+    if (text.trim().isEmpty) return;
+    final err = mesh.sendMessage(text);
+    _controller.clear();
+    if (err != null && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(err)));
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scroll.hasClients) {
+        _scroll.animateTo(_scroll.position.maxScrollExtent,
+            duration: const Duration(milliseconds: 200), curve: Curves.easeOut);
+      }
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
-    final meshService = Provider.of<MeshService>(context);
-
+    final mesh = context.watch<MeshService>();
     return Scaffold(
       appBar: AppBar(
-        title: Text('Emergency Mesh [${meshService.activeNetwork}]'),
+        title: Text('[${mesh.activeNetwork}]'),
         actions: [
+          Center(
+            child: Padding(
+              padding: const EdgeInsets.only(right: 12),
+              child: Text('${mesh.livePeers.length} peers',
+                  style: const TextStyle(fontSize: 12, color: Colors.grey)),
+            ),
+          ),
           IconButton(
             icon: const Icon(Icons.info_outline),
-            onPressed: () {
-              showModalBottomSheet(
-                context: context,
-                builder: (_) => Container(
-                  padding: const EdgeInsets.all(16),
-                  child: Text('Node ID: ${meshService.nodeId}\nTransport: BLE / P2P Mesh'),
-                ),
-              );
-            },
+            onPressed: () => showModalBottomSheet(
+              context: context,
+              builder: (_) => Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(mainAxisSize: MainAxisSize.min, children: [
+                  Text('Node ID: ${mesh.nodeId}'),
+                  const SizedBox(height: 6),
+                  Text('Transport: ${mesh.me?.transport ?? '-'}',
+                      textAlign: TextAlign.center),
+                  const SizedBox(height: 6),
+                  Text('Home: ${mesh.me?.home ?? '-'}',
+                      style: const TextStyle(fontSize: 11, color: Colors.grey)),
+                ]),
+              ),
+            ),
           ),
         ],
       ),
       body: Column(
         children: [
           Expanded(
-            child: meshService.messages.isEmpty
+            child: mesh.messages.isEmpty
                 ? const Center(
-                    child: Text(
-                      'No messages yet in [default]\nType a message or tap 📍 to share GPS over BLE',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(color: Colors.grey),
+                    child: Padding(
+                      padding: EdgeInsets.all(24),
+                      child: Text(
+                        'Nothing on the mesh yet.\n\n'
+                        'Anything you type is broadcast to everyone in this network.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(color: Colors.grey),
+                      ),
                     ),
                   )
                 : ListView.builder(
+                    controller: _scroll,
                     padding: const EdgeInsets.all(12),
-                    itemCount: meshService.messages.length,
-                    itemBuilder: (context, index) {
-                      final msg = meshService.messages[index];
-                      return MessageBubble(message: msg);
-                    },
+                    itemCount: mesh.messages.length,
+                    itemBuilder: (_, i) => MessageBubble(message: mesh.messages[i]),
                   ),
           ),
           Container(
-            padding: const EdgeInsets.symmetric(horizontal: 8.0, vertical: 4.0),
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
             color: const Color(0xFF1E1E1E),
-            child: Row(
-              children: [
-                IconButton(
-                  tooltip: 'Share Offline GPS Location',
-                  icon: const Icon(Icons.my_location, color: Colors.cyan),
-                  onPressed: () async {
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(
-                        content: Text('Sharing GPS location over BLE mesh...'),
-                        duration: Duration(seconds: 1),
-                      ),
-                    );
-                    await meshService.shareCurrentLocation();
-                  },
-                ),
-                Expanded(
-                  child: TextField(
-                    controller: _textController,
-                    decoration: const InputDecoration(
-                      hintText: 'Broadcast message to mesh...',
-                      border: InputBorder.none,
-                    ),
-                    onSubmitted: (val) {
-                      meshService.sendMessage(val);
-                      _textController.clear();
+            child: SafeArea(
+              top: false,
+              child: Row(
+                children: [
+                  IconButton(
+                    tooltip: 'Share my GPS position',
+                    icon: const Icon(Icons.my_location, color: Colors.cyan),
+                    onPressed: () async {
+                      final err = await mesh.shareCurrentLocation();
+                      if (context.mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                          content: Text(err ?? 'position shared with the mesh'),
+                        ));
+                      }
                     },
                   ),
-                ),
-                IconButton(
-                  icon: const Icon(Icons.send, color: Colors.amber),
-                  onPressed: () {
-                    meshService.sendMessage(_textController.text);
-                    _textController.clear();
-                  },
-                ),
-              ],
+                  Expanded(
+                    child: TextField(
+                      controller: _controller,
+                      textInputAction: TextInputAction.send,
+                      decoration: const InputDecoration(
+                        hintText: 'Message everyone in range...',
+                        border: InputBorder.none,
+                      ),
+                      onSubmitted: (_) => _send(mesh),
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.send, color: Colors.amber),
+                    onPressed: () => _send(mesh),
+                  ),
+                ],
+              ),
             ),
           ),
         ],

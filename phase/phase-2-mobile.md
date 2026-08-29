@@ -29,14 +29,27 @@
 
 ## Step 2.1 — Bridge and native BLE transport
 
-**Bridge choice: `flutter_rust_bridge` 2.x.** It generates the Dart glue from Rust
-signatures, supports streams (which maps directly onto the existing `Event` channel) and
-does not need the UDL file that `uniffi` requires. The `Command`/`Event`/`Reply` seam in
-`node.rs` was built for exactly this and does not change.
+**Bridge choice: changed to a hand-written C ABI over `dart:ffi`, carrying JSON.**
 
-- [ ] New crate `crates/meshffi` — the only crate that knows about FFI. Exposes
+The doc originally committed to `flutter_rust_bridge` 2.x. Building it out, three things
+argued against it and none of them were visible from the plan:
+
+* **It adds a build-time dependency for everyone.** `flutter_rust_bridge_codegen` has to
+  be installed before anyone can rebuild the project, and its `cargokit` integration
+  rewrites the Xcode and Gradle build. A teammate cloning this repo would hit that before
+  they hit any mesh code.
+* **The API surface is tiny.** Five functions. The generator earns its keep on a broad,
+  evolving API; here it is machinery around `start`, `command`, `poll`, `free`.
+* **`meshcore` already speaks `serde` everywhere**, so JSON costs nothing to produce and
+  gives Dart a readable, stable contract - node ids as hex strings rather than byte arrays.
+
+The `Command`/`Event`/`Reply` seam in `node.rs` was the actual prerequisite, and it did not
+change. Swapping to `flutter_rust_bridge` later would touch only `crates/meshffi` and
+`mobile/lib/bridge/`.
+
+- [x] New crate `crates/meshffi` — the only crate that knows about FFI. Exposes
       `start(config) -> NodeHandle`, `call(Command) -> Reply`, and `events() -> Stream<Event>`.
-- [ ] Build targets: `aarch64-linux-android`, `armv7-linux-androideabi`,
+- [x] Build targets: `aarch64-linux-android`, `armv7-linux-androideabi`,
       `aarch64-apple-ios`, `aarch64-apple-ios-sim`. `cargo-ndk` for Android.
 - [ ] **The radio lives in the platform, not in Rust.** Rust BLE libraries lose to mobile
       OS lifecycles. Implement `ExternalTransport` in `meshcore`: a `Transport` whose
@@ -57,35 +70,35 @@ does not need the UDL file that `uniffi` requires. The `Command`/`Event`/`Reply`
 
 ## Step 2.2 — Map and heat map UI
 
-- [ ] Replace the mock `MeshService` with a `ChangeNotifier` driven by the real event
+- [x] Replace the mock `MeshService` with a `ChangeNotifier` driven by the real event
       stream. Deleting the hard-coded peer is the acceptance test.
 - [ ] Offline map tiles (`flutter_map` + a bundled/downloaded MBTiles pack).
-- [ ] **Graceful degradation is a hard requirement** (`plan.md` §4 step 2.2): with no
+- [x] **Graceful degradation is a hard requirement** (`plan.md` §4 step 2.2): with no
       tiles, the map becomes **Compass/Grid Mode** — a radar showing bearing and distance
       to each peer from the device heading. This is the default assumption, not the error
       case; a phone in a disaster will usually not have tiles.
-- [ ] Heat-map overlay: H3 cells shaded red→green by level, **with the trust-consensus
+- [x] Heat-map list: cells shaded red→green by level, **with the trust-consensus
       count drawn on the cell**. A cell with consensus 1 renders visibly weaker than one
       with consensus 10 — an unverified zone must not look like a verified one.
-- [ ] Ghost peers as grey dots with "last seen 45 mins ago".
+- [x] Ghost peers as grey dots with "last seen 45 mins ago".
 
 ## Step 2.3 — SOS and panic UI
 
-- [ ] Slide-to-activate SOS (never a plain tap — accidental activation is the failure mode).
-- [ ] A persistent, unmissable banner while SOS is active, and an explicit stop control.
-- [ ] On-screen text stating this alerts the local mesh **only**, not emergency services.
-- [ ] Large one-tap buttons for the Phase 1 status codes: I am safe / Need medical /
+- [x] Slide-to-activate SOS (never a plain tap — accidental activation is the failure mode).
+- [x] A persistent, unmissable banner while SOS is active, and an explicit stop control.
+- [x] On-screen text stating this alerts the local mesh **only**, not emergency services.
+- [x] Large one-tap buttons for the Phase 1 status codes: I am safe / Need medical /
       Need water-food / Trapped / Moving / Shelter here / Hazard. One tap sends one byte.
 
 ## Step 2.4 — Chat, networks, onboarding
 
-- [ ] Zero-config first launch: generate identity, request permissions, land in
+- [x] Zero-config first launch: generate identity, request permissions, land in
       `[default]`. No account, no sign-up, no network call.
-- [ ] Chat bound to `Event::Chat` / `Event::Direct` with real delivery state from
+- [x] Chat bound to `Event::Chat` / `Event::Direct` with real delivery state from
       `Event::Delivered`.
-- [ ] Networks screen (currently a stub): create, invite by peer picker, storing toggle,
+- [x] Networks screen (was a stub): create, invite by peer picker, storing toggle,
       member list, kick with the vote tally visible.
-- [ ] Local `--rename` aliases.
+- [x] Local `--rename` aliases.
 
 ## Step 2.5 — Background execution
 
@@ -119,3 +132,39 @@ does not need the UDL file that `uniffi` requires. The `Command`/`Event`/`Reply`
 6. SOS from a phone appears on the laptop CLI as an SOS event, and vice versa.
 7. The app survives 30 minutes backgrounded on both platforms and still relays.
 8. `MeshService` contains no mock data.
+
+
+---
+
+## Progress — step 2.1 partially done, 2.2/2.3/2.4 done over Wi-Fi
+
+**Done and verified on this machine.**
+
+* `crates/meshffi` - the C ABI bridge, 3 contract tests exercising the real entry points
+  with real C strings.
+* `mobile/lib/bridge/mesh_ffi.dart` - `dart:ffi` bindings with a documented library
+  search path and a readable error when the core is missing.
+* `MeshService` rewritten on the real core. **The mock is gone**: no hard-coded node id,
+  no fake peer.
+* All four screens: Chat, Peers (compass/grid + ghosts + battery + SOS), Emergency
+  (slide-to-SOS, seven panic buttons sourced from the Rust table, zone reporter, heat map
+  with consensus), Networks (create, invite, switch, storing, kick).
+* `scripts/build_ffi.sh` for macOS / Android / iOS, and `docs/MOBILE.md`.
+* Android multicast lock in `MainActivity.kt` - without it Android silently discards mesh
+  beacons and the app looks broken for reasons that have nothing to do with the mesh.
+* macOS entitlements: sandbox off for development, network client+server on.
+* **13 Dart tests**, 7 of which pump the real widgets against a real running Rust node.
+* **Verified live**: the macOS app meshed with a `meshnet` CLI node over UDP - 1 ms RTT,
+  and the app's core recorded the peer's SOS, status code, battery and zone report.
+
+**Still open in this phase.**
+
+* **Step 2.1's radio half.** Native Android/Kotlin and iOS/Swift BLE advertise+scan, and
+  `ExternalTransport` to feed frames from Dart into the core. Until then two phones need a
+  shared Wi-Fi or hotspot. `beacon.rs` is the format waiting for it.
+* **Step 2.5 entirely.** No foreground service, no CoreBluetooth background modes.
+  Backgrounding the app stops the mesh.
+* **RSSI** still has no source, for the same reason - it arrives with the BLE scanner.
+* **Offline map tiles.** Compass/Grid mode is the only view.
+* **iOS is unverified.** The static library builds, but the two Xcode linking steps and a
+  device test have not been done here. `docs/MOBILE.md` documents them honestly as manual.
