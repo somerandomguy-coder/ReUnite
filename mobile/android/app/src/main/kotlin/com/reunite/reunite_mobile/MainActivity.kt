@@ -70,6 +70,7 @@ class MainActivity : FlutterActivity() {
                 when (call.method) {
                     "isSupported" -> result.success(radio().isSupported())
                     "isEnabled" -> result.success(radio().isEnabled())
+                    "state" -> result.success(radio().state())
                     "start" -> {
                         val error = radio().start()
                         if (error == null) result.success(true)
@@ -77,6 +78,14 @@ class MainActivity : FlutterActivity() {
                     }
                     "stop" -> { ble?.stop(); result.success(true) }
                     "connectedCount" -> result.success(ble?.connectedCount() ?: 0)
+                    "setCadence" -> {
+                        radio().setCadence(
+                            call.argument<String>("scan") ?: "low_latency",
+                            (call.argument<Number>("windowMs"))?.toLong(),
+                            (call.argument<Number>("periodMs"))?.toLong(),
+                        )
+                        result.success(true)
+                    }
                     "send" -> {
                         val hex = call.argument<String>("frame")
                         val target = call.argument<String>("to")
@@ -109,6 +118,16 @@ class MainActivity : FlutterActivity() {
             onLog = { message ->
                 Log.i(TAG, message)
                 main.post { events?.success(mapOf("type" to "log", "message" to message)) }
+            },
+            onState = { state ->
+                main.post { events?.success(mapOf("type" to "radio_state", "state" to state)) }
+            },
+            onRssi = { device, rssi ->
+                main.post {
+                    events?.success(
+                        mapOf("type" to "rssi", "device" to device, "rssi" to rssi)
+                    )
+                }
             },
         )
         ble = created

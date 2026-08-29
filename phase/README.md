@@ -6,9 +6,20 @@ they touch, wire-format specs, acceptance criteria, and the deviations it accept
 
 | Phase | File | Scope | Gate |
 | :--- | :--- | :--- | :--- |
-| 1 | [`phase-1-terminal-mvp.md`](phase-1-terminal-mvp.md) | Production-ready Rust core + terminal MVP: discovery, routing, private networks, SOS, panic codes, H3 heat map, ghosting | **next** |
-| 2 | [`phase-2-mobile.md`](phase-2-mobile.md) | iOS/Android app on the real core: native BLE transport, `flutter_rust_bridge`, map/compass, SOS UI, background execution | blocked on 1 |
-| 3 | [`phase-3-embedded.md`](phase-3-embedded.md) | `no_std` core split, ESP32/nRF52 firmware, drone sky-relays and SOS triangulation | blocked on 2 |
+| 1 | [`phase-1-terminal-mvp.md`](phase-1-terminal-mvp.md) | Production-ready Rust core + terminal MVP: discovery, routing, private networks, SOS, panic codes, H3 heat map, ghosting | **complete** |
+| 2 | [`phase-2-mobile.md`](phase-2-mobile.md) | iOS/Android app on the real core: native BLE transport, `dart:ffi` bridge, map/compass, SOS UI, background execution | steps 2.2–2.4 done; 2.1 radio half and 2.5 open |
+| 2A | [`phase-2a-build-and-display-integrity.md`](phase-2a-build-and-display-integrity.md) | Restore the deleted build system, green `flutter analyze`, green `cargo test`, docs that match the code | **complete** |
+| 2B | [`phase-2b-safe-unsafe-zones.md`](phase-2b-safe-unsafe-zones.md) | Binary safe/unsafe verdict over a user-entered radius; 16-report ring; overlapping translucent circles | **complete** |
+| 2C | [`phase-2c-ble-interop.md`](phase-2c-ble-interop.md) | Android ↔ iOS Bluetooth discovery: why it never worked, and the fix | **fix landed, awaiting a two-phone test**; Beacon v1 on the air deferred |
+| 2D | [`phase-2d-zero-touch-join.md`](phase-2d-zero-touch-join.md) | Every radio at once, adaptive duty cycle, laptops that join by being switched on | **complete**, except the battery measurement — moved to 2E |
+| 2E | [`phase-2e-hardware-verification.md`](phase-2e-hardware-verification.md) | Run 2C and 2D on two real phones. **The only phase that cannot be done from a laptop**, and the handover document for whoever does | **next** |
+| 3 | [`phase-3-embedded.md`](phase-3-embedded.md) | `no_std` core split, ESP32/nRF52 firmware, drone sky-relays and SOS triangulation | blocked on 2E |
+
+> **Phases 2A–2E were inserted after Phase 2 shipped.** 2A–2D are complete and green;
+> **2E is where the project actually is.** Everything about Bluetooth in 2C and 2D was
+> established by reading code, never by running it on a radio — see
+> [`phase-2e-hardware-verification.md`](phase-2e-hardware-verification.md), which is
+> written as a handover for whoever has two phones.
 
 ## Working protocol
 
@@ -44,6 +55,9 @@ dropped. Each has an owning phase.
 | D4 | Data storage is SQLite (`rusqlite`) | JSON + JSONL files under `~/.meshnet` | Keep files for Phase 1 — they are inspectable, atomic-written and tested. Revisit in Phase 2 when the mobile UI needs indexed history queries | 2 |
 | D5 | Public networks are unencrypted broadcasts | `[default]` uses a well-known key derived from a constant | Keep. It is functionally public (the key is in the source) but routes public traffic through one code path instead of two, which removes a whole class of bug | — (accepted) |
 | D6 | Battery level in every beacon | No battery telemetry anywhere | Add a `battery` provider with a `--battery` override so demos and CI are deterministic | 1 |
+| D7 | §3.2 One byte carrying the safety *average* of a hex grid | The scale answered a question people cannot answer under stress, and its mean blurred disagreement into a false amber | Replace with a verdict bit plus a 16-bit radius the reporter chooses. 3 bytes, still one packet per cell, still no raw coordinates | 2B |
+| D8 | §3.2 Red/green *gradient* | The gradient implied a precision the input never had | Two colours. Density of agreement varies instead, by opacity of overlapping circles, with both vote counts shown as numbers | 2B |
+| D9 | §2 Zero-config onboarding | Held, but the app asked which radio to use — a configuration question put to someone in an emergency | **Done in 2D.** Every radio starts at once; the picker is a status panel; permissions are requested lazily and a refusal degrades rather than blocks | 2D |
 
 ## Step numbering
 

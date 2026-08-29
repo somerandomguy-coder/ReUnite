@@ -22,11 +22,13 @@ class EmergencyScreen extends StatelessWidget {
           const _SectionTitle('Send a status', 'One tap. One byte on the mesh.'),
           _PanicButtons(mesh: mesh),
           const SizedBox(height: 28),
-          const _SectionTitle('Report how safe it is here',
-              'Snapped to a hex cell before it is shared, so the map stays readable.'),
+          const _SectionTitle('Report the area around you',
+              'Safe or unsafe, over a radius you choose. Snapped to a hex cell before it '
+              'is shared, so the map stays readable.'),
           _ZoneReporter(mesh: mesh),
           const SizedBox(height: 28),
-          const _SectionTitle('Safe zones', 'Consensus is how many people verified a zone.'),
+          const _SectionTitle('Reported zones',
+              'Both vote counts are shown. A tie reads unsafe.'),
           _Heatmap(mesh: mesh),
           const SizedBox(height: 32),
         ],
@@ -215,48 +217,180 @@ class _ZoneReporter extends StatefulWidget {
   State<_ZoneReporter> createState() => _ZoneReporterState();
 }
 
+/// Two questions, in this order: is it safe, and how far does that reach.
+///
+/// The verdict is deliberately binary. A 0-4 scale asked something nobody can answer
+/// under stress - "is this a 2 or a 3?" has no defensible answer at 3 a.m. in a flooded
+/// street - and averaging the answers turned four people disagreeing into one amber
+/// number nobody had said.
 class _ZoneReporterState extends State<_ZoneReporter> {
-  double _level = 4;
+  final _length = TextEditingController(text: '500');
+  bool? _safe;
+  bool _sending = false;
 
-  static const _labels = ['Dangerous', 'Risky', 'Unclear', 'Mostly safe', 'Safe'];
+  RadiusUnit get _unit => widget.mesh.lastRadiusUnit;
+  set _unit(RadiusUnit u) => widget.mesh.lastRadiusUnit = u;
+
+  @override
+  void dispose() {
+    _length.dispose();
+    super.dispose();
+  }
+
+  int? get _radiusM {
+    final value = double.tryParse(_length.text.trim());
+    if (value == null || value <= 0) return null;
+    final metres = _unit.toMetres(value);
+    if (metres < kMinRadiusM || metres > kMaxRadiusM) return null;
+    return metres;
+  }
+
+  Future<void> _send() async {
+    final radius = _radiusM;
+    if (_safe == null || radius == null || _sending) return;
+    setState(() => _sending = true);
+    final err = await widget.mesh.reportZoneHere(_safe!, radius);
+    if (!mounted) return;
+    setState(() => _sending = false);
+    _snack(
+      context,
+      err ??
+          'Reported ${_safe! ? "safe" : "unsafe"} within ${formatRadius(radius)} '
+              'to the mesh.',
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
+    final radius = _radiusM;
+    final ready = _safe != null && radius != null;
+
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
         color: const Color(0xFF23282E),
         borderRadius: BorderRadius.circular(10),
       ),
-      child: Column(children: [
-        Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-          const Text('How safe is where you are?'),
-          Text(_labels[_level.round()],
-              style: TextStyle(
-                  color: Color.lerp(Colors.redAccent, Colors.greenAccent, _level / 4),
-                  fontWeight: FontWeight.bold)),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Text('Is it safe where you are?',
+            style: TextStyle(fontWeight: FontWeight.bold)),
+        const SizedBox(height: 10),
+        Row(children: [
+          Expanded(
+            child: _VerdictButton(
+              label: 'SAFE',
+              icon: Icons.check_circle_outline,
+              colour: Colors.greenAccent,
+              selected: _safe == true,
+              onTap: () => setState(() => _safe = true),
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: _VerdictButton(
+              label: 'UNSAFE',
+              icon: Icons.dangerous_outlined,
+              colour: Colors.redAccent,
+              selected: _safe == false,
+              onTap: () => setState(() => _safe = false),
+            ),
+          ),
         ]),
-        Slider(
-          value: _level,
-          min: 0,
-          max: 4,
-          divisions: 4,
-          activeColor: Color.lerp(Colors.redAccent, Colors.greenAccent, _level / 4),
-          label: _labels[_level.round()],
-          onChanged: (v) => setState(() => _level = v),
+        const SizedBox(height: 16),
+        const Text('Covering a radius of', style: TextStyle(fontSize: 13)),
+        const SizedBox(height: 6),
+        Row(children: [
+          SizedBox(
+            width: 110,
+            child: TextField(
+              controller: _length,
+              keyboardType: const TextInputType.numberWithOptions(decimal: true),
+              decoration: const InputDecoration(
+                isDense: true,
+                border: OutlineInputBorder(),
+                contentPadding: EdgeInsets.symmetric(horizontal: 10, vertical: 12),
+              ),
+              onChanged: (_) => setState(() {}),
+            ),
+          ),
+          const SizedBox(width: 10),
+          DropdownButton<RadiusUnit>(
+            value: _unit,
+            onChanged: (u) => setState(() => _unit = u ?? _unit),
+            items: [
+              for (final u in RadiusUnit.values)
+                DropdownMenuItem(value: u, child: Text(u.label)),
+            ],
+          ),
+        ]),
+        const SizedBox(height: 6),
+        // Show what is about to be claimed, before it is claimed. The number the user
+        // typed is not the number that travels - the position is snapped to a hex cell
+        // first - and hiding that would make the map look more precise than it is.
+        Text(
+          radius == null
+              ? 'Enter $kMinRadiusM m to ${kMaxRadiusM ~/ 1000} km.'
+              : 'You are vouching for everything within ${formatRadius(radius)} of you. '
+                  'Your exact position is snapped to a hex cell before it is sent.',
+          style: TextStyle(
+            fontSize: 11,
+            color: radius == null ? Colors.orangeAccent : Colors.grey,
+          ),
         ),
+        const SizedBox(height: 12),
         SizedBox(
           width: double.infinity,
           child: FilledButton.icon(
             icon: const Icon(Icons.add_location_alt),
-            label: const Text('Report this area'),
-            onPressed: () async {
-              final err = await widget.mesh.reportZoneHere(_level.round());
-              if (context.mounted) _snack(context, err ?? 'zone reported to the mesh');
-            },
+            label: Text(_sending ? 'Sending...' : 'Report this area'),
+            onPressed: ready && !_sending ? _send : null,
           ),
         ),
       ]),
+    );
+  }
+}
+
+class _VerdictButton extends StatelessWidget {
+  final String label;
+  final IconData icon;
+  final Color colour;
+  final bool selected;
+  final VoidCallback onTap;
+
+  const _VerdictButton({
+    required this.label,
+    required this.icon,
+    required this.colour,
+    required this.selected,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(8),
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 14),
+        decoration: BoxDecoration(
+          color: selected ? colour.withValues(alpha: 0.22) : Colors.transparent,
+          border: Border.all(
+            color: selected ? colour : Colors.grey.shade700,
+            width: selected ? 2 : 1,
+          ),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Column(children: [
+          Icon(icon, color: selected ? colour : Colors.grey, size: 26),
+          const SizedBox(height: 4),
+          Text(label,
+              style: TextStyle(
+                color: selected ? colour : Colors.grey,
+                fontWeight: FontWeight.bold,
+              )),
+        ]),
+      ),
     );
   }
 }
@@ -284,7 +418,7 @@ class _ZoneTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final colour = Color.lerp(Colors.redAccent, Colors.greenAccent, zone.levelScaled / 4)!;
+    final colour = zone.isSafe ? Colors.greenAccent : Colors.redAccent;
     // An unverified zone must not look like a confirmed one, so a single report is drawn
     // washed out and labelled. plan.md §3.2.
     final confidence = zone.verified ? 1.0 : 0.45;
@@ -300,24 +434,68 @@ class _ZoneTile extends StatelessWidget {
           ),
         ),
         title: Row(children: [
-          Text('${zone.levelScaled.toStringAsFixed(1)}/4',
+          Text(zone.isSafe ? 'SAFE' : 'UNSAFE',
               style: TextStyle(color: colour, fontWeight: FontWeight.bold)),
-          const SizedBox(width: 10),
-          if (zone.verified)
-            Text('${zone.consensus} verifying',
-                style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold))
-          else
-            const Text('1 report — unverified',
-                style: TextStyle(fontSize: 12, color: Colors.orangeAccent)),
+          const SizedBox(width: 8),
+          Text('within ${formatRadius(zone.radiusM)}',
+              style: const TextStyle(fontSize: 12, color: Colors.grey)),
         ]),
-        subtitle: Text(
-          '${zone.lat.toStringAsFixed(5)}, ${zone.lon.toStringAsFixed(5)}'
-          ' · ${formatAge(zone.ageMs)}${zone.mine ? ' · you reported this' : ''}',
-          style: const TextStyle(fontSize: 11),
-        ),
+        subtitle: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          // Both counts, always. "5 say safe" and "5 say safe, 4 say unsafe" are
+          // different claims and must not render the same way.
+          Row(children: [
+            _VoteChip(count: zone.safeVotes, colour: Colors.greenAccent, label: 'safe'),
+            const SizedBox(width: 6),
+            _VoteChip(count: zone.unsafeVotes, colour: Colors.redAccent, label: 'unsafe'),
+            if (zone.contested) ...[
+              const SizedBox(width: 8),
+              const Text('contested',
+                  style: TextStyle(
+                      fontSize: 11,
+                      color: Colors.orangeAccent,
+                      fontWeight: FontWeight.bold)),
+            ] else if (!zone.verified) ...[
+              const SizedBox(width: 8),
+              const Text('unverified',
+                  style: TextStyle(fontSize: 11, color: Colors.orangeAccent)),
+            ],
+          ]),
+          const SizedBox(height: 2),
+          Text(
+            '${zone.lat.toStringAsFixed(5)}, ${zone.lon.toStringAsFixed(5)}'
+            ' · ${formatAge(zone.ageMs)}${zone.mine ? ' · you reported this' : ''}',
+            style: const TextStyle(fontSize: 11),
+          ),
+        ]),
+        isThreeLine: true,
         trailing: Text(zone.cell.substring(0, 6),
             style: const TextStyle(fontSize: 10, color: Colors.grey)),
       ),
+    );
+  }
+}
+
+class _VoteChip extends StatelessWidget {
+  final int count;
+  final Color colour;
+  final String label;
+  const _VoteChip({required this.count, required this.colour, required this.label});
+
+  @override
+  Widget build(BuildContext context) {
+    final dim = count == 0;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: colour.withValues(alpha: dim ? 0.06 : 0.18),
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Text('$count $label',
+          style: TextStyle(
+            fontSize: 11,
+            color: dim ? Colors.grey : colour,
+            fontWeight: dim ? FontWeight.normal : FontWeight.bold,
+          )),
     );
   }
 }

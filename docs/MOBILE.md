@@ -133,12 +133,26 @@ This is the case the whole project exists for: no router, no hotspot, no cell se
 
 1. Install the app on **both** phones (§2 for Android, §3 for iPhone).
 2. Turn Bluetooth on. You can leave Wi-Fi and mobile data off entirely.
-3. On each phone: **Networks** tab → under **Radio**, tap **Bluetooth**.
-4. Grant the Bluetooth permissions when asked. Android asks for three separate ones
+3. Grant the Bluetooth permissions when asked. Android asks for three separate ones
    (scan, advertise, connect) and refuses silently without all three.
 
-Under **Radio** each phone then shows *Searching for other phones…* and, once they find
-each other, *Connected to 1 phone(s) over Bluetooth. No Wi-Fi needed.*
+There is **no radio to pick**. The app starts every radio the phone has and uses all of
+them at once; refusing the Bluetooth permission costs Bluetooth, not the mesh, and the
+Radio panel says so.
+
+The **Radio** panel on the Networks tab reports what the platform has actually told the
+app, one fact per line:
+
+```
+Bluetooth radio is on
+  Reported state    on
+  Connected peers   0
+```
+
+`Reported state` is the operating system's own answer, not a guess — that distinction
+matters, and §6 explains why. `Connected peers` is how many peers a frame could reach
+right now. When it is `0` and the state is `on`, the radio is working and has simply not
+found anybody yet.
 
 Everything in §5 works identically from there: chat, positions, panic messages, SOS,
 zones, ghosting. The mesh does not know or care which radio carried a frame.
@@ -154,12 +168,28 @@ running `meshnet --transport ble` joins the same mesh.
 That is exactly why relaying matters: a third phone between two others extends the mesh,
 and `--peers` will show the far one as `relayed` with 2 hops.
 
+### If they do not find each other
+
+Work down this list and stop at the first step that does not do what it says. It is
+ordered so that each step rules out everything above it.
+
+| # | Check | What it means |
+| :--- | :--- | :--- |
+| 1 | **Radio** panel says `Reported state: on` on *both* phones | If it says `off`, `unauthorized` or `unsupported`, fix that first — the app is repeating what the OS told it. If it says `unknown`, the OS has not answered yet; give it a second. |
+| 2 | Android logcat shows `advertising as a mesh node` | `adb logcat -s ReUniteBle`. `advertising failed with code 5` means the chipset has no peripheral role; that phone can still connect outward, but two such phones can never find each other. |
+| 3 | Android logcat shows no `scan failed with code N` | Code 2 is app-registration-failed, which on Android 12+ almost always means the *Nearby devices* permission was never granted at runtime. |
+| 4 | A third-party scanner sees each phone | Install **nRF Connect** on both and filter on `a1b2c3d4-e5f6-7890-1234-56789abcdef0`. This is the one test that separates "the radios cannot see each other" from "our code cannot see them". |
+| 5 | The log shows `<id> is a mesh peer` | The GATT connection resolved the mesh service. If you get `connecting to <id>` and never this line, the connection is failing after discovery. |
+| 6 | `Connected peers` goes above 0 | Frames can now cross. Anything still broken is above the radio. |
+
+Other symptoms:
+
 | Symptom | Fix |
 | :--- | :--- |
-| Stuck on "Searching for other phones…" | Both phones must be on the Bluetooth radio, both with the app open and on screen. Bring them within a few metres to pair up the first time. |
+| Peers found, but nothing arrives | Both phones must be on the **same network** — the `[default]` lobby unless you switched. Check the Networks tab. |
 | "Bluetooth permission was refused" | Android: Settings → Apps → ReUnite → Permissions → *Nearby devices*. iOS: Settings → ReUnite → Bluetooth. |
-| Android says advertising failed | Some older or budget chipsets cannot advertise as a peripheral. That phone can still receive by connecting outward, but two such phones cannot find each other. |
 | Works, then stops when the screen locks | Expected today. Background execution is not implemented — see §7. |
+| An iPhone is invisible to an Android phone while backgrounded | Not fixable in this app. Backgrounded iOS moves 128-bit service UUIDs into the advertisement's *overflow area*, which non-Apple scanners cannot read. Keep the app on screen. |
 
 ## 4. Getting devices onto the same mesh
 
@@ -221,17 +251,39 @@ the radar. Clear it with *Stand down*.
 > services. `plan.md` §3.2 keeps the two apart precisely so that testing this app can
 > never dial a real emergency line.
 
-### 5.6 The safe-zone heat map and consensus
+### 5.6 Safe and unsafe zones
 
-On device A: **Emergency** → set the slider to *Safe* → **Report this area**. A zone card
-appears reading `4.0/4` and **1 report — unverified**.
+On device A: **Emergency** → **Report the area around you**.
 
-Now do the same on device B, standing in the same place. Both devices update to show
-`2 verifying` and the card brightens.
+1. Tap **SAFE** or **UNSAFE**. There is no scale — the question is deliberately one you
+   can answer without thinking about it.
+2. Type a length in the field and pick a unit: metres, kilometres, feet or miles. The line
+   under the field tells you what you are about to claim, and reminds you that your exact
+   position is snapped to a hex cell before anything is sent.
+3. **Report this area**.
 
-Report again from B and the count **stays at 2** — the consensus counts *people*, not
-reports, so no single device can manufacture agreement. That is the whole reason the number
-is shown separately from the colour.
+A zone card appears reading `UNSAFE` · `within 750 m`, with two chips — `0 safe` and
+`1 unsafe` — and the label **unverified**, because one person is not a consensus.
+
+Now report the *opposite* verdict from device B, standing in the same place. Both devices
+show `1 safe / 1 unsafe` and the card stays **UNSAFE**, now labelled **contested**. That
+is the rule: a cell reads safe only when more people vouch for it than against it, and a
+tie resolves to unsafe. Nothing is averaged into an amber middle.
+
+Report again from B and the counts **do not move** — votes count *people*, not reports, so
+no single device can manufacture agreement.
+
+On the **Peers → Interactive Map** tab, the zone is a translucent circle of the radius you
+gave, red for unsafe and green for safe. Report the same area from a third device and the
+circle visibly darkens: overlap density is the consensus signal, and the legend bottom-left
+shows what 1, 3 and 5+ reporters look like. It never reaches full opacity, because the map
+underneath is how somebody navigates out.
+
+> **Nothing files a safety report on your behalf.** The app shares your *position*
+> automatically every two minutes so peers can place you, but a safety verdict is only
+> ever sent when a person taps the button. An earlier build auto-reported "safe" from GPS
+> every two minutes; that manufactured exactly the false consensus the vote counts exist
+> to prevent.
 
 ### 5.7 Ghosting
 
@@ -283,6 +335,9 @@ Being explicit, because the difference matters if you are testing:
 * **iOS needs the two manual Xcode steps in §3**, and they have not been performed here
   either. Without them Dart cannot find the core's symbols and the app shows the
   "mesh core did not start" screen.
+* **RSSI is now plumbed**, so the peers list ranks by real signal strength on Bluetooth.
+  It has no source on Wi-Fi and stays blank there — Wi-Fi RSSI belongs to the
+  association, not to a peer.
 * **No background execution.** Backgrounding the app stops the mesh. Android needs a
   foreground service; iOS has the CoreBluetooth background modes declared but no state
   restoration — Phase 2 step 2.5.

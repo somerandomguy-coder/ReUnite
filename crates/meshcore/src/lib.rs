@@ -5,6 +5,7 @@
 //!   `packet`    - frame + packet wire format, TTL and path recording
 //!   `beacon`    - the BLE-advertisement-sized wire format (27 byte budget)
 //!   `router`    - neighbours, learned routes, duplicate suppression
+//!   `duty`      - how hard to beacon and scan, given how alone we are
 //!   `crypto`/`net` - identities, network keys, invites, kick votes
 //!   `status`/`zones` - pre-canned panic codes, H3 heat-map aggregation and consensus
 //!   `node`      - the actor that ties it together and exposes Command/Event
@@ -15,6 +16,7 @@
 pub mod battery;
 pub mod beacon;
 pub mod crypto;
+pub mod duty;
 pub mod ffi;
 pub mod geo;
 pub mod identity;

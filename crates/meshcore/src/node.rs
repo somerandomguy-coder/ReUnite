@@ -26,6 +26,7 @@ use crate::router::Router;
 use crate::store::{self, Contact, StoredMessage};
 use crate::types::{now_ms, Gps, MsgId, NetworkId, NodeId};
 use crate::transport::Transport;
+use crate::duty::{self, Cadence};
 use crate::zones::{self, ZoneBook, ZoneView};
 
 const OUTBOX_RETRY_MS: u64 = 15_000;
@@ -93,7 +94,12 @@ pub enum Command {
     /// Broadcast a pre-canned panic message. `0` clears it.
     SetStatus { code: u8 },
     /// Submit a safety report; snapped to an H3 cell before it goes anywhere.
-    ReportZone { lat: f64, lon: f64, level: u8 },
+    ReportZone {
+        lat: f64,
+        lon: f64,
+        verdict: zones::Verdict,
+        radius_m: u32,
+    },
     Heatmap,
 }
 
@@ -220,12 +226,26 @@ pub enum Event {
         id: NodeId,
         display: String,
     },
-    /// A safe-zone cell changed level or gained a verifier.
+    /// A zone cell changed its verdict or gained a voter.
     ZoneUpdate {
         cell: u64,
-        level: u8,
-        consensus: u8,
+        verdict: zones::Verdict,
+        radius_m: u32,
+        /// Kept as two numbers, never one. plan.md §3.2: "safe, 5 people say so" and
+        /// "safe, 5 say so and 4 disagree" are different claims and must read differently.
+        safe_votes: u32,
+        unsafe_votes: u32,
         from: String,
+    },
+    /// The radio should change how hard it is beaconing and scanning.
+    ///
+    /// Emitted only when the rung changes, not on every tick: the platform reconfigures
+    /// a scanner by restarting it, which is not something to do every three seconds.
+    Cadence {
+        hello_ms: u64,
+        scan: &'static str,
+        /// `Some((window_ms, period_ms))` for a windowed scan, `None` for continuous.
+        scan_window_ms: Option<(u64, u64)>,
     },
     /// The active network changed; the CLI repaints its prompt from this.
     Context(String),
@@ -294,6 +314,10 @@ pub struct Node {
     beacon_seq: u8,
     /// Round-robin cursor over our own zone reports, for periodic re-gossip.
     zone_gossip_idx: usize,
+    /// When we last heard anything at all from anyone. Drives the duty-cycle ladder.
+    last_heard_ms: u64,
+    /// The cadence currently in force, so the radio is only reconfigured on a change.
+    cadence: duty::Cadence,
 }
 
 impl Node {
@@ -339,6 +363,10 @@ impl Node {
             zone_resolution: config.zone_resolution,
             beacon_seq: 0,
             zone_gossip_idx: 0,
+            // Starting "just heard something" gives the join race its full first minute
+            // at the fast rate, rather than treating a cold start as solitude.
+            last_heard_ms: now_ms(),
+            cadence: duty::Cadence::ENGAGED,
         };
 
         tokio::spawn(node.run(
@@ -361,6 +389,11 @@ impl Node {
         let mut ping = tokio::time::interval(ping_interval);
         let mut maintenance = tokio::time::interval(maintenance_interval);
         let transport = self.transport.clone();
+        // `hello_interval` from the config is the *engaged* rate; the ladder scales it
+        // from there. A test that pins a fast interval keeps a fast interval, because
+        // its nodes can hear each other and never leave the top rung.
+        let base_hello = hello_interval;
+        let mut beacon_seq: u64 = 0;
 
         loop {
             tokio::select! {
@@ -379,7 +412,26 @@ impl Node {
                     let result = self.on_command(cmd).await;
                     let _ = reply.send(result);
                 }
-                _ = hello.tick() => { let _ = self.send_hello().await; }
+                _ = hello.tick() => {
+                    let _ = self.send_hello().await;
+                    beacon_seq = beacon_seq.wrapping_add(1);
+                    // Re-arm at whatever rate the current conditions call for. Tokio's
+                    // interval period is fixed at construction, so a change of rung means
+                    // a new interval rather than a mutated one.
+                    let next = self.current_cadence(base_hello);
+                    if next.hello != self.cadence.hello || next.scan != self.cadence.scan {
+                        self.cadence = next;
+                        hello = tokio::time::interval(duty::jitter(next.hello, beacon_seq));
+                        hello.tick().await; // the first tick of a fresh interval is immediate
+                        let _ = self.events.try_send(Event::Cadence {
+                            hello_ms: next.hello.as_millis() as u64,
+                            scan: next.scan.as_str(),
+                            scan_window_ms: next
+                                .scan_window
+                                .map(|(w, p)| (w.as_millis() as u64, p.as_millis() as u64)),
+                        });
+                    }
+                }
                 _ = ping.tick() => { let _ = self.ping_neighbors().await; }
                 _ = maintenance.tick() => { self.maintenance().await; }
                 else => break,
@@ -498,10 +550,34 @@ impl Node {
             body: beacon::Body::Zone(beacon::Zone {
                 origin: self.identity.id,
                 cell,
-                level: zone.level(),
+                verdict: zone.verdict().to_wire(),
                 consensus: zone.consensus(),
+                // The advertisement gets two bytes for this, so a radius past 65 km
+                // cannot be expressed - `MAX_RADIUS_M` is far below that already.
+                radius_m: zone.radius_m().min(u16::MAX as u32) as u16,
             }),
         })
+    }
+
+    /// The cadence the current conditions call for, scaled from the configured base rate.
+    fn current_cadence(&self, base_hello: Duration) -> Cadence {
+        let peers = self.router.neighbors().count();
+        // Any SOS we know about, ours or a peer's. Relaying someone else's emergency is
+        // not the time to be economical either.
+        let sos = self.sos || self.contacts.values().any(|c| c.sos);
+        let mut cadence = duty::cadence(duty::Conditions {
+            alone_for_ms: now_ms().saturating_sub(self.last_heard_ms),
+            peers,
+            sos,
+            battery: self.battery_percent(),
+        });
+        // Scale the ladder against the configured base, so `--hello-interval` style
+        // overrides and the fast intervals the tests use are still honoured.
+        if base_hello != Cadence::ENGAGED.hello {
+            let ratio = cadence.hello.as_millis() as f64 / Cadence::ENGAGED.hello.as_millis() as f64;
+            cadence.hello = base_hello.mul_f64(ratio);
+        }
+        cadence
     }
 
     async fn ping_neighbors(&mut self) -> Result<()> {
@@ -561,6 +637,11 @@ impl Node {
     // -------------------------------------------------------------- inbound
 
     async fn on_frame(&mut self, bytes: &[u8], from: SocketAddr) -> Result<()> {
+        // Before the frame is parsed, let alone accepted. Anything at all on the air
+        // means we are not alone, including a frame we cannot decrypt or a version we do
+        // not understand - being slow to notice a rescuer costs more than a beacon does.
+        self.last_heard_ms = now_ms();
+
         let frame = Frame::decode(bytes)?;
         if frame.link_from == self.identity.id {
             if frame.instance != self.instance {
@@ -573,6 +654,13 @@ impl Node {
             return Ok(()); // simulated out of radio range
         }
         self.router.note_neighbor(frame.link_from, from);
+        // The scanner sees signal strength per advertisement, keyed by a device id; only
+        // here, when a frame names its sender, can that reading be attached to a node.
+        // This is where `Router::note_rssi` finally gets a source - it has existed and
+        // returned nothing useful since Phase 1, because UDP has no per-peer RSSI.
+        if let Some(rssi) = self.transport.rssi_for(&from) {
+            self.router.note_rssi(&frame.link_from, rssi);
+        }
 
         let packet = frame.packet;
         self.router
@@ -909,16 +997,26 @@ impl Node {
                     }
                 });
             }
-            NetPayload::Zone { cell, level } => {
+            NetPayload::Zone {
+                cell,
+                verdict,
+                radius_m,
+            } => {
                 // The reporter is the packet origin, not whoever relayed it - that is what
-                // keeps the consensus count one-per-person.
-                if self.zones.record(cell, from_id, level, packet.sent_at_ms) {
+                // keeps the vote counts one-per-person.
+                let verdict = zones::Verdict::from_wire(verdict);
+                if self
+                    .zones
+                    .record(cell, from_id, verdict, radius_m, packet.sent_at_ms)
+                {
                     self.zones.save()?;
                     if let Some(zone) = self.zones.get(cell) {
                         let _ = self.events.try_send(Event::ZoneUpdate {
                             cell,
-                            level: zone.level(),
-                            consensus: zone.consensus(),
+                            verdict: zone.verdict(),
+                            radius_m: zone.radius_m(),
+                            safe_votes: zone.safe_votes(),
+                            unsafe_votes: zone.unsafe_votes(),
                             from,
                         });
                     }
@@ -1142,11 +1240,19 @@ impl Node {
         if mine.is_empty() {
             return;
         }
-        let (cell, level) = mine[self.zone_gossip_idx % mine.len()];
+        let (cell, verdict, radius_m) = mine[self.zone_gossip_idx % mine.len()];
         self.zone_gossip_idx = self.zone_gossip_idx.wrapping_add(1);
         let net = self.current;
         let _ = self
-            .send_payload(net, None, NetPayload::Zone { cell, level })
+            .send_payload(
+                net,
+                None,
+                NetPayload::Zone {
+                    cell,
+                    verdict: verdict.to_wire(),
+                    radius_m,
+                },
+            )
             .await;
     }
 
@@ -1270,7 +1376,12 @@ impl Node {
             Command::SetLinkFilter(users) => self.cmd_link_filter(users),
             Command::Sos(active) => self.cmd_sos(active).await,
             Command::SetStatus { code } => self.cmd_status(code).await,
-            Command::ReportZone { lat, lon, level } => self.cmd_report_zone(lat, lon, level).await,
+            Command::ReportZone {
+                lat,
+                lon,
+                verdict,
+                radius_m,
+            } => self.cmd_report_zone(lat, lon, verdict, radius_m).await,
             Command::Heatmap => Ok(Reply::Heatmap(
                 self.zones.views(&self.identity.id, now_ms()),
             )),
@@ -1540,33 +1651,48 @@ impl Node {
     }
 
     /// `--report-zone [lat] [lon] [level]` (plan.md §4 step 1.5).
-    async fn cmd_report_zone(&mut self, lat: f64, lon: f64, level: u8) -> Result<Reply> {
-        if level > zones::MAX_LEVEL {
+    async fn cmd_report_zone(
+        &mut self,
+        lat: f64,
+        lon: f64,
+        verdict: zones::Verdict,
+        radius_m: u32,
+    ) -> Result<Reply> {
+        if !(zones::MIN_RADIUS_M..=zones::MAX_RADIUS_M).contains(&radius_m) {
             bail!(
-                "level must be 0..={} (0 = dangerous, {} = safe)",
-                zones::MAX_LEVEL,
-                zones::MAX_LEVEL
+                "radius must be {} m to {} km",
+                zones::MIN_RADIUS_M,
+                zones::MAX_RADIUS_M / 1000
             );
         }
         let cell = zones::cell_for(lat, lon, self.zone_resolution)?;
-        let byte = zones::level_to_byte(level);
         let now = now_ms();
-        self.zones.record(cell, self.identity.id, byte, now);
+        // `record_own` also moves this cell to the newest end of the 16-entry re-gossip
+        // ring; a plain `record` would leave us republishing something we have replaced.
+        self.zones
+            .record_own(cell, self.identity.id, verdict, radius_m, now);
         self.zones.save()?;
         let net = self.current;
         let name = self.current_network_name();
-        self.send_payload(net, None, NetPayload::Zone { cell, level: byte })
-            .await?;
-        let (consensus, aggregate) = self
-            .zones
-            .get(cell)
-            .map(|z| (z.consensus(), z.level()))
-            .unwrap_or((1, byte));
+        self.send_payload(
+            net,
+            None,
+            NetPayload::Zone {
+                cell,
+                verdict: verdict.to_wire(),
+                radius_m,
+            },
+        )
+        .await?;
+        let zone = self.zones.get(cell);
+        let safe = zone.map(|z| z.safe_votes()).unwrap_or(0);
+        let unsafe_votes = zone.map(|z| z.unsafe_votes()).unwrap_or(0);
+        let aggregate = zone.map(|z| z.verdict()).unwrap_or(verdict);
         Ok(Reply::Ok(format!(
-            "[{name}] reported cell {cell:x} at level {level}/{} - now {:.1}/{} with {consensus} verifying",
-            zones::MAX_LEVEL,
-            zones::byte_to_level(aggregate),
-            zones::MAX_LEVEL
+            "[{name}] reported {} within {} of cell {cell:x} - now reads {} ({safe} safe / {unsafe_votes} unsafe)",
+            verdict.as_str(),
+            zones::fmt_radius(radius_m),
+            aggregate.as_str(),
         )))
     }
 

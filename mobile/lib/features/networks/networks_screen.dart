@@ -221,43 +221,113 @@ class _TransportPicker extends StatelessWidget {
   final MeshService mesh;
   const _TransportPicker({required this.mesh});
 
+  /// What the platform has actually told us, rendered as one line each.
+  ///
+  /// This panel exists because "no peers yet" and "the radio never started" look
+  /// identical from the outside and are completely different problems. Every row states
+  /// something the app was told; none of them guesses.
   @override
   Widget build(BuildContext context) {
+    final bluetooth = mesh.usingBluetooth;
+    final state = mesh.radioState;
+    final (Color colour, IconData icon, String headline) = switch (state) {
+      'on' => (Colors.cyanAccent, Icons.bluetooth_connected, 'Bluetooth radio is on'),
+      'off' => (Colors.orangeAccent, Icons.bluetooth_disabled, 'Bluetooth is switched off'),
+      'unauthorized' => (
+          Colors.orangeAccent,
+          Icons.lock_outline,
+          'Bluetooth permission was refused'
+        ),
+      'unsupported' => (Colors.grey, Icons.block, 'No Bluetooth LE radio on this device'),
+      'resetting' => (Colors.grey, Icons.sync, 'Bluetooth is restarting'),
+      _ => (Colors.grey, Icons.hourglass_empty, 'Waiting for the radio to report in'),
+    };
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const Text('Active Radio Engine', style: TextStyle(fontWeight: FontWeight.bold)),
+        const Text('Radio', style: TextStyle(fontWeight: FontWeight.bold)),
         const SizedBox(height: 6),
         Container(
           padding: const EdgeInsets.all(12),
           decoration: BoxDecoration(
-            color: Colors.blue.shade900.withOpacity(0.2),
+            color: Colors.blue.shade900.withValues(alpha: 0.2),
             borderRadius: BorderRadius.circular(8),
-            border: Border.all(color: Colors.cyanAccent.withOpacity(0.5)),
+            border: Border.all(color: colour.withValues(alpha: 0.5)),
           ),
-          child: Row(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Icon(Icons.bluetooth, color: Colors.cyanAccent),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text('Bluetooth Low Energy (BLE) Mesh',
-                        style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                    Text(
-                      mesh.bleConnected == 0
-                          ? 'Scanning for surrounding phone radios...'
-                          : 'Connected to ${mesh.bleConnected} peer phone(s) off-grid.',
-                      style: const TextStyle(fontSize: 11, color: Colors.grey),
-                    ),
-                  ],
+              Row(children: [
+                Icon(bluetooth ? icon : Icons.wifi, color: colour),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    bluetooth ? headline : 'Meshing over ${mesh.radioNames}',
+                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                  ),
                 ),
-              ),
+              ]),
+              const SizedBox(height: 8),
+              if (mesh.radioNotice != null)
+                _DiagLine(label: 'Note', value: mesh.radioNotice!, warn: true),
+              _DiagLine(label: 'Radios', value: mesh.radioNames),
+              if (bluetooth) ...[
+                _DiagLine(label: 'Bluetooth state', value: state),
+                _DiagLine(
+                  label: 'Connected peers',
+                  value: '${mesh.bleConnected}',
+                  warn: mesh.bleConnected == 0 && state == 'on',
+                ),
+                if (mesh.bleError != null)
+                  _DiagLine(label: 'Last error', value: mesh.bleError!, warn: true),
+                const SizedBox(height: 6),
+                Text(
+                  mesh.bleConnected == 0 && state == 'on'
+                      ? 'The radio is running and has found nobody yet. Both phones need '
+                          'the app open and on screen, within a few metres for the first '
+                          'connection.'
+                      : 'Frames cross as opaque bytes; every protocol decision stays in '
+                          'the mesh core.',
+                  style: const TextStyle(fontSize: 11, color: Colors.grey),
+                ),
+              ],
             ],
           ),
         ),
       ],
+    );
+  }
+}
+
+/// One fact, labelled. Deliberately dull: this panel is read when something is wrong.
+class _DiagLine extends StatelessWidget {
+  final String label;
+  final String value;
+  final bool warn;
+  const _DiagLine({required this.label, required this.value, this.warn = false});
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        SizedBox(
+          width: 120,
+          child: Text(label,
+              style: const TextStyle(fontSize: 11, color: Colors.grey)),
+        ),
+        Expanded(
+          child: SelectableText(
+            value,
+            style: TextStyle(
+              fontSize: 11,
+              fontFamily: 'monospace',
+              color: warn ? Colors.orangeAccent : Colors.white70,
+            ),
+          ),
+        ),
+      ]),
     );
   }
 }

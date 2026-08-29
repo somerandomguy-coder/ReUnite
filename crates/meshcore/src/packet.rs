@@ -14,7 +14,7 @@ use crate::crypto::SealedBox;
 use crate::types::{Gps, MsgId, NetworkId, NodeId};
 
 pub const MAGIC: u32 = 0x4d45_5348; // "MESH"
-pub const VERSION: u8 = 3;
+pub const VERSION: u8 = 4;
 pub const DEFAULT_TTL: u8 = 8;
 /// Keep frames comfortably inside a single UDP datagram (and, later, a BLE MTU chain).
 pub const MAX_FRAME_BYTES: usize = 8 * 1024;
@@ -174,8 +174,16 @@ pub enum NetPayload {
     Status { code: u8 },
     /// In-network SOS. Explicitly *not* the OS emergency-services SOS.
     Sos { active: bool, gps: Option<Gps> },
-    /// One node's safety report for one H3 cell (plan.md §4 step 1.5).
-    Zone { cell: u64, level: u8 },
+    /// One node's safe/unsafe call about the area around an H3 cell (phase 2B).
+    ///
+    /// `verdict` is one bit widened to a byte; `radius_m` is how far the reporter is
+    /// vouching. The cell keeps the reporter's exact position off the air, the radius
+    /// carries the only thing the cell cannot express - how much they actually saw.
+    Zone {
+        cell: u64,
+        verdict: u8,
+        radius_m: u32,
+    },
 }
 
 /// Plaintext inside an `Invite` sealed box.
