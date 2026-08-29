@@ -73,6 +73,15 @@ struct Args {
     /// Only hear these node ids (simulated radio range, for testing multi-hop routing).
     #[arg(long = "isolate", value_name = "NODE_ID", num_args = 1..)]
     isolate: Vec<String>,
+
+    /// Report this battery percentage instead of asking the platform. Keeps demos
+    /// deterministic and gives a mains-powered desktop something to advertise.
+    #[arg(long, value_name = "PCT", value_parser = clap::value_parser!(u8).range(0..=100))]
+    battery: Option<u8>,
+
+    /// H3 resolution for safe-zone aggregation (higher = smaller cells).
+    #[arg(long, default_value_t = meshcore::zones::DEFAULT_RESOLUTION)]
+    zone_resolution: u8,
 }
 
 #[tokio::main]
@@ -127,6 +136,8 @@ async fn main() -> Result<()> {
         }),
         _ => None,
     };
+    config.battery_override = args.battery;
+    config.zone_resolution = args.zone_resolution;
     config.link_filter = args
         .isolate
         .iter()
@@ -253,6 +264,10 @@ async fn handle_line(
             Ok(Outcome::Continue)
         }
         "--quit" | "--exit" => Ok(Outcome::Quit),
+        "--status" if rest.is_empty() => {
+            println!("{}", render::status_table(style));
+            Ok(Outcome::Continue)
+        }
         _ => {
             let command = parse_command(cmd, rest)?;
             let reply = handle.call(command).await?;
@@ -345,6 +360,34 @@ fn parse_command(cmd: &str, rest: &[String]) -> Result<Command> {
             Ok(Command::SetLocation { lat, lon })
         }
         "--share-location" => Ok(Command::ShareLocation),
+        "--sos" => match rest.first().map(String::as_str) {
+            Some("start") | Some("on") => Ok(Command::Sos(true)),
+            Some("stop") | Some("off") => Ok(Command::Sos(false)),
+            _ => bail!("usage: --sos start | --sos stop (in-network only, never emergency services)"),
+        },
+        "--status" => {
+            let arg = rest
+                .first()
+                .ok_or_else(|| anyhow!("usage: --status [code|name]"))?;
+            let code = meshcore::status::parse(arg)
+                .ok_or_else(|| anyhow!("unknown status '{arg}' - run --status with no argument for the list"))?;
+            Ok(Command::SetStatus { code })
+        }
+        "--report-zone" => {
+            if rest.len() < 3 {
+                bail!("usage: --report-zone [lat] [lon] [level 0-4]");
+            }
+            let lat: f64 = rest[0].parse().map_err(|_| anyhow!("bad latitude"))?;
+            let lon: f64 = rest[1].parse().map_err(|_| anyhow!("bad longitude"))?;
+            let level: u8 = rest[2]
+                .parse()
+                .map_err(|_| anyhow!("bad level - use 0 (dangerous) to 4 (safe)"))?;
+            Ok(Command::ReportZone { lat, lon, level })
+        }
+        "--heatmap" => match rest.first().map(String::as_str) {
+            None | Some("show") => Ok(Command::Heatmap),
+            Some(other) => bail!("unknown option '{other}' - usage: --heatmap show"),
+        },
         "--isolate" => Ok(Command::SetLinkFilter(rest.to_vec())),
         other => Err(anyhow!("unknown command '{other}' - try --help")),
     }
@@ -358,6 +401,7 @@ fn show(style: &Style, reply: Reply) {
         Reply::Routes(routes) => println!("{}", render::routes_table(style, &routes)),
         Reply::History(msgs) => println!("{}", render::history_lines(style, &msgs)),
         Reply::Whoami(w) => println!("{}", render::whoami(style, &w)),
+        Reply::Heatmap(zones) => println!("{}", render::heatmap_table(style, &zones)),
     }
 }
 

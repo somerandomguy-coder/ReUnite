@@ -14,7 +14,7 @@ use crate::crypto::SealedBox;
 use crate::types::{Gps, MsgId, NetworkId, NodeId};
 
 pub const MAGIC: u32 = 0x4d45_5348; // "MESH"
-pub const VERSION: u8 = 2;
+pub const VERSION: u8 = 3;
 pub const DEFAULT_TTL: u8 = 8;
 /// Keep frames comfortably inside a single UDP datagram (and, later, a BLE MTU chain).
 pub const MAX_FRAME_BYTES: usize = 8 * 1024;
@@ -134,6 +134,12 @@ pub struct Hello {
     /// What the node calls itself. Local `--rename` aliases always win over this.
     pub name: Option<String>,
     pub gps: Option<Gps>,
+    /// Charge 0..=100, `None` when the platform will not report it (plan.md §3.1).
+    pub battery: Option<u8>,
+    /// In-network SOS flag. Mirrors `beacon::FLAG_SOS`.
+    pub sos: bool,
+    /// Last pre-canned status code, so a node that arrives late still learns it.
+    pub status: Option<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -164,6 +170,12 @@ pub enum NetPayload {
     KickVote { target: NodeId, epoch: u32 },
     /// End-to-end delivery receipt for a direct message.
     Ack { msg: MsgId },
+    /// A pre-canned panic message. One byte, never a string (plan.md §3.2).
+    Status { code: u8 },
+    /// In-network SOS. Explicitly *not* the OS emergency-services SOS.
+    Sos { active: bool, gps: Option<Gps> },
+    /// One node's safety report for one H3 cell (plan.md §4 step 1.5).
+    Zone { cell: u64, level: u8 },
 }
 
 /// Plaintext inside an `Invite` sealed box.

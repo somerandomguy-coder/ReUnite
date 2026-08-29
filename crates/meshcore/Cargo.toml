@@ -11,6 +11,7 @@ async-trait.workspace = true
 bincode.workspace = true
 chacha20poly1305.workspace = true
 ed25519-dalek.workspace = true
+h3o.workspace = true
 hex.workspace = true
 hkdf.workspace = true
 rand_core.workspace = true

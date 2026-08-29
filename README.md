@@ -27,7 +27,7 @@ The full plan is [`plan.md`](plan.md); it is broken into executable phases in
 
 | Phase | Scope | Status |
 | :--- | :--- | :--- |
-| [1](phase/phase-1-terminal-mvp.md) | Rust core + terminal MVP | **in progress** — see the step table below |
+| [1](phase/phase-1-terminal-mvp.md) | Rust core + terminal MVP | **complete** — see the step table below |
 | [2](phase/phase-2-mobile.md) | iOS/Android app on the real core | not started; `mobile/` is a UI shell over mock data |
 | [3](phase/phase-3-embedded.md) | `no_std` core, ESP32/nRF52, drone relays | not started |
 
@@ -39,15 +39,16 @@ Numbering follows the current `plan.md` §4.
 | :--- | :--- |
 | 1.1 Hashed node id, zero-config `[default]` onboarding, GPS beacons | done |
 | 1.1 Connectionless discovery | done over UDP multicast/broadcast; BLE on Linux only |
-| 1.1 Battery-level telemetry | **not started** |
+| 1.1 Battery-level telemetry | done (macOS + Linux; `--battery` overrides) |
+| 1.1 Beacon v1, the 27-byte BLE-advertisement wire format | done (encoded and tested; needs a Phase 2 radio to emit it) |
 | 1.2 Store-and-forward routing with TTL, RSSI/latency route table | done (RSSI awaits a radio that reports it) |
 | 1.2 `clap` CLI, local state, `--rename` aliases | done |
-| 1.2 Binary-packed pre-canned messages | **not started** |
+| 1.2 Binary-packed pre-canned messages | done — 7 codes, one byte each |
 | 1.3 Private networks, X25519 sealed key exchange, `--enable-storing` | done |
 | 1.3 Decentralised kick voting with automatic re-key | done |
-| 1.4 In-network SOS | **not started** |
-| 1.4 "Last known location" ghosting | partial — last GPS and timestamp are cached, nothing renders them |
-| 1.5 H3 hex-grid heat map with trust consensus | **not started** |
+| 1.4 In-network SOS | done — longer TTL, isolated from OS emergency services |
+| 1.4 "Last known location" ghosting | done — unreachable peers stay on `--peers` at their last fix |
+| 1.5 H3 hex-grid heat map with trust consensus | done — resolution 8, one report per node per cell |
 
 **One honest deviation.** Phase 1 runs the mesh over **Wi-Fi (UDP), not BLE**. Laptops
 cannot portably *advertise* as BLE peripherals — `btleplug` and the equivalent libraries
@@ -105,29 +106,47 @@ broadcast to the network you are currently in.
 | `--networks` | Networks you belong to |
 | `--history [n]` | Stored messages for the active network |
 | `--set-location [lat] [lon]` / `--share-location` | Set and publish your GPS position |
+| `--sos start` / `--sos stop` | Raise or clear the in-network SOS |
+| `--status [code\|name]` | Send a pre-canned 1-byte message; no argument lists them |
+| `--report-zone [lat] [lon] [0-4]` | Report how safe a place is, aggregated into an H3 cell |
+| `--heatmap show` | Aggregated safe zones with their trust-consensus counts |
 | `--whoami` | Your id, network, transport, home directory |
 | `--isolate [id ...]` | Pretend only these nodes are in radio range (testing) |
 | `--help` / `--quit` | |
 
 A `[user]` may be a full node id, a unique id prefix, or a name you set with `--rename`.
 
-### Planned in Phase 1 — not implemented yet
-
-These are specified in [`plan.md`](plan.md) §5 and
-[`phase/phase-1-terminal-mvp.md`](phase/phase-1-terminal-mvp.md). Typing them today returns
-`unknown command`.
-
-| Command | Will do |
-| :--- | :--- |
-| `--sos start` / `--sos stop` | Toggle the high-priority in-network SOS broadcast |
-| `--status [code]` | Send a pre-canned 1-byte message (`1` = safe, `2` = medical, …) |
-| `--report-zone [lat] [lon] [lvl]` | Submit a safety report, aggregated into an H3 hex grid |
-| `--heatmap show` | Dump the aggregated safety zones with their trust-consensus counts |
-| `--battery [pct]` | Override the reported battery level (for demos and tests) |
+Startup flags: `--home`, `--name`, `--port`, `--group`, `--peer`, `--lat`/`--lon`,
+`--transport`, `--isolate`, `--battery [0-100]` (override the reported charge) and
+`--zone-resolution` (H3 resolution for the heat map).
 
 > **The in-network SOS is deliberately isolated from your phone's or laptop's emergency
 > services SOS.** It raises an alert on the local mesh only. It does not, and will not,
 > call emergency services.
+
+### Emergency features, in one minute
+
+```
+[default] > --status medical            # one byte on the wire, not the words
+[default] > --sos start                 # ttl 12, mesh alert only
+[default] > --report-zone 10.7769 106.7009 4
+[default] > --heatmap show
+CELL               LAT          LON          SAFETY     CONSENSUS  AGE    MINE
+8865b5662bfffff    10.77508     106.69941    3.0/4      2          2s     yes
+
+[default] > --peers
+ID                 NAME             LINK     HOPS   RTT      DISTANCE   BATT   SEEN    NET
+acfd53bb3f4e5430   ~carol           relayed  2      -        -          7%     now     yes
+  !! SOS - last heard just now
+d965fdd41a1a1940   ~doomed          ghost    -      -        1.11km     3%     38s     yes
+  last seen at 10.78690, 106.70090 38s ago
+  * I am safe
+```
+
+A peer whose battery dies becomes a dimmed **ghost** at their last known position rather
+than vanishing. `SAFETY` is the mean of every node's report for that hex cell; `CONSENSUS`
+is how many distinct nodes verified it, and is deliberately shown as its own number — one
+person calling a street safe is not the same claim as thirty.
 
 ## Mobile
 
@@ -163,6 +182,9 @@ phase/            phase-by-phase build plan
 cargo test
 ```
 
-Covers the sealed-key exchange, packet signing and tamper rejection, duplicate-flood
-suppression, route preference, simulated radio range, kick thresholds and re-keying, state
-persistence and GPS distance.
+18 tests covering the sealed-key exchange, packet signing and tamper rejection,
+duplicate-flood suppression, route preference, simulated radio range, kick thresholds and
+re-keying, state persistence, GPS distance, Beacon v1 byte-exact round-trips and size
+budget, pre-canned status codes, H3 cell snapping, zone consensus counting people rather
+than reports, and the fact that a relay outside a private network cannot read its SOS,
+status or zone traffic.
