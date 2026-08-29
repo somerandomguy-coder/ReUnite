@@ -146,6 +146,22 @@ impl Transport for UdpTransport {
                     .join(", ")
             ));
         }
+        // Multicast off, broadcast off, no seeds: `send_broadcast` has nothing to aim at
+        // and silently sends nowhere. That is the state an un-entitled iPhone is in when
+        // nobody handed it a peer address, and until a frame arrives from someone who
+        // *does* know ours it stays that way. Say so, or the banner shows a Wi-Fi radio
+        // that looks exactly as healthy as one that is meshing.
+        if !self.config.multicast && !self.config.broadcast && self.config.seeds.is_empty() {
+            // A link we have heard from is a real, usable address, so the warning has to
+            // clear itself once one exists - the configuration never changes, but the
+            // radio stops being stranded.
+            let learned = self.links.lock().map(|l| l.len()).unwrap_or(0);
+            if learned == 0 {
+                parts.push("no discovery path (waiting to be found)".to_string());
+            } else {
+                parts.push(format!("{learned} learned link(s)"));
+            }
+        }
         parts.join(", ")
     }
 }

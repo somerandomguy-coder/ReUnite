@@ -290,16 +290,58 @@ pub struct ZoneBook {
     res: u8,
 }
 
+/// Move a file we cannot read aside and keep it.
+///
+/// Renamed rather than deleted, because it is the only evidence of what went wrong and a
+/// destroyed file turns a bug report into a guess. A failed rename is ignored on purpose:
+/// housekeeping must never be the reason a node does not start.
+fn quarantine(path: &Path, why: &anyhow::Error) {
+    let bad = path.with_extension("json.bad");
+    let _ = std::fs::rename(path, &bad);
+    eprintln!(
+        "meshcore: {why:#} - moved to {} and continuing with an empty zone cache",
+        bad.display()
+    );
+}
+
 impl ZoneBook {
+    /// Load the aggregated zone cache.
+    ///
+    /// **An unreadable cache degrades to an empty one; it never stops the node.** This
+    /// file holds other people's safety votes, and every one of them is re-learned from
+    /// the mesh within a gossip round or two. Refusing to start trades a recoverable
+    /// cache for the entire node.
+    ///
+    /// That is not hypothetical. `df0bcbb` changed `Report` from `{level}` to
+    /// `{verdict, radius_m}`, and every install that had ever written a `zones.json` came
+    /// back up as *"the mesh core did not start"* - permanently, with no way out but
+    /// deleting the app - on a phone whose owner may be trying to call for help.
+    ///
+    /// `identity.json` and `networks.json` deliberately keep failing loudly instead:
+    /// losing an identity changes who you are to the mesh, and a lost network key cannot
+    /// be recovered by any amount of gossip. Those are worth stopping for. This is not.
     pub fn load(home: &Path, res: u8) -> Result<Self> {
-        let file: ZonesFile = read_json(&home.join("zones.json"))?.unwrap_or_default();
+        let path = home.join("zones.json");
+        let file: ZonesFile = match read_json(&path) {
+            Ok(found) => found.unwrap_or_default(),
+            Err(e) => {
+                quarantine(&path, &e);
+                ZonesFile::default()
+            }
+        };
         let mut zones = BTreeMap::new();
         for rec in file.zones {
-            let cell = u64::from_str_radix(&rec.cell, 16)
-                .map_err(|e| anyhow!("zones.json: bad cell {}: {e}", rec.cell))?;
+            // One malformed record must not cost the other cells, for the same reason the
+            // whole file must not cost the node. `own_ring` below has always skipped
+            // rather than aborted; this brings the votes into line with it.
+            let Ok(cell) = u64::from_str_radix(&rec.cell, 16) else {
+                continue;
+            };
             let mut reports = HashMap::new();
             for (node, report) in rec.reports {
-                reports.insert(NodeId::from_hex(&node)?, report);
+                if let Ok(id) = NodeId::from_hex(&node) {
+                    reports.insert(id, report);
+                }
             }
             zones.insert(cell, Zone { cell, reports });
         }

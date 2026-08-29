@@ -155,11 +155,67 @@ void main() {
     await tester.tap(find.text('Networks'));
     await tester.pumpAndSettle();
 
+    // Our own node id must be shown so someone can be invited by it.
+    expect(find.text(mesh.nodeId), findsOneWidget);
+
+    // The network cards sit below the node's own details and the Radio panel, which grew
+    // a Wi-Fi section, so scroll them into view first - a lazy ListView has not built
+    // what is still off-screen.
+    for (var i = 0; i < 8 && find.text('rescue').evaluate().isEmpty; i++) {
+      await tester.drag(find.byType(ListView).first, const Offset(0, -400));
+      await tester.pumpAndSettle();
+    }
+
     expect(find.text('rescue'), findsOneWidget);
     expect(find.text('default'), findsOneWidget);
     expect(find.textContaining('Treat anything here as public'), findsOneWidget);
-    // Our own node id must be shown so someone can be invited by it.
-    expect(find.text(mesh.nodeId), findsOneWidget);
+  });
+
+  testWidgets('the Radio panel states what Wi-Fi can reach rather than leaving 0 peers bare',
+      (tester) async {
+    // This node was started the way an iPhone starts: no broadcast, no multicast, no
+    // seeds. Every line below is a configuration fact the app can read off itself - none
+    // of them claims to know why nobody has been heard from.
+    expect(mesh.udpAutoDiscovery, isFalse);
+    expect(mesh.seedPeers, isEmpty);
+
+    await pumpApp(tester);
+    await tester.tap(find.text('Networks'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Wi-Fi discovery'), findsOneWidget);
+    expect(find.text('off - direct peers only'), findsOneWidget);
+    expect(find.text('Direct peers'), findsOneWidget);
+    expect(find.text('none configured'), findsOneWidget);
+    expect(find.text('Add peer'), findsOneWidget);
+  });
+
+  testWidgets('a peer typed into the Radio panel lands where the next start reads it',
+      (tester) async {
+    expect(await mesh.addPeer(' 10.17.158.195:47474 '), isNull, reason: 'trimmed');
+    expect(mesh.seedPeers, ['10.17.158.195:47474']);
+
+    // Beside the core's own state, so it survives the app being killed - the whole point
+    // of the panel over a --dart-define, which is gone the next time somebody rebuilds.
+    final saved = File('${home.path}/peers.txt');
+    expect(saved.existsSync(), isTrue);
+    expect(saved.readAsStringSync().trim(), '10.17.158.195:47474');
+
+    // A typo is refused here, because the core parses seeds with filter_map and drops a
+    // bad one without a word.
+    expect(await mesh.addPeer('10.17.158.195'), isNotNull);
+    expect(await mesh.addPeer('10.17.158.195:47474'), isNull, reason: 'already saved');
+    expect(mesh.seedPeers, ['10.17.158.195:47474']);
+
+    await pumpApp(tester);
+    await tester.tap(find.text('Networks'));
+    await tester.pumpAndSettle();
+    // Once in the 'Direct peers' line, once as the chip that can delete it again.
+    expect(find.text('10.17.158.195:47474'), findsWidgets);
+
+    expect(await mesh.removePeer('10.17.158.195:47474'), isNull);
+    expect(mesh.seedPeers, isEmpty);
+    expect(saved.readAsStringSync(), isEmpty);
   });
 
   testWidgets('the peers tab degrades to compass mode with no map tiles', (tester) async {

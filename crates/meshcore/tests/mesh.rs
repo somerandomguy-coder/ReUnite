@@ -677,3 +677,33 @@ fn jitter_spreads_nodes_without_drifting_the_rate() {
     let mean = spread.iter().sum::<u64>() as f64 / spread.len() as f64;
     assert!((mean - 10_000.0).abs() < 400.0, "mean drifted to {mean}ms");
 }
+
+/// A `zones.json` written by a build from before commit `df0bcbb` used `{"level": u8}`
+/// per report; the current `Report` needs `verdict` and `radius_m`. Upgrading an install
+/// across that change must not brick the node.
+///
+/// This is not hypothetical: it took an iPhone out entirely. `ZoneBook::load` returned
+/// the serde error, `Node::spawn` passed it up, and the app showed "the mesh core did not
+/// start" on every launch, forever, with no way back other than deleting the app.
+#[test]
+fn an_out_of_date_zones_file_does_not_stop_the_node_from_starting() {
+    let home = temp_home("zones-legacy");
+    std::fs::write(
+        home.join("zones.json"),
+        r#"{"zones":[{"cell":"8a2a1072b59ffff",
+             "reports":[["0102030405060708",{"level":200,"ts_ms":1000}]]}]}"#,
+    )
+    .unwrap();
+
+    let book = ZoneBook::load(&home, zones::DEFAULT_RESOLUTION)
+        .expect("a stale zone cache must degrade, not refuse to load");
+    let cell = u64::from_str_radix("8a2a1072b59ffff", 16).unwrap();
+    assert!(book.get(cell).is_none(), "unreadable votes are dropped, not invented");
+
+    // Quarantined rather than deleted: it is the only evidence of what went wrong, and
+    // this codebase does not destroy a user's file to make an error go away.
+    assert!(
+        home.join("zones.json.bad").exists(),
+        "the unreadable file should be kept for inspection"
+    );
+}

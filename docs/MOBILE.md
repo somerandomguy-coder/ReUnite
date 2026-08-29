@@ -119,11 +119,37 @@ iOS then needs **two manual Xcode steps** that cannot be scripted safely:
 
 Then `flutter run -d <iphone>`.
 
-> **iOS limitation, be aware of it.** Since iOS 14, multicast and broadcast require the
-> `com.apple.developer.networking.multicast` entitlement, which Apple grants only on
-> application. The app therefore disables multicast on iOS and relies on **broadcast plus
-> explicitly added peers**. An iPhone will reliably reach nodes you add by IP; automatic
-> discovery may not work until that entitlement is granted.
+> **iOS limitation, be aware of it.** Apple gates UDP multicast **and UDP broadcast** —
+> sending and receiving alike — behind the `com.apple.developer.networking.multicast`
+> entitlement, which is restricted and granted only on application. Enforcement is real
+> from iOS 16 onward.
+>
+> **An iPhone therefore has no automatic discovery at all.** Not degraded, not unreliable:
+> none. Its only legal path is plain unicast to an address it has been given, so the app
+> starts iOS with multicast *and* broadcast off and relies entirely on explicitly added
+> peers. A phone with no seed can neither find anybody nor be found.
+>
+> This is where to add one — either works, and only **one side** of a pair needs it,
+> because a node remembers the source of every frame it receives and answers there:
+>
+> * **Before the first run**, at build time:
+>   `flutter run --dart-define=MESH_PEERS=10.17.158.195:47474` (comma-separated for more).
+> * **Once the app is running**, in the app: **Networks** tab → **Radio** panel →
+>   **Add peer**. Saved on the device to `<home>/peers.txt` and merged in on every launch.
+>
+> Accept the **"ReUnite would like to find and connect to devices on your local network"**
+> prompt when it appears. If it was ever denied, it is at **Settings → Privacy & Security
+> → Local Network → ReUnite**, and nothing will work until it is on.
+>
+> **A new peer needs a real relaunch, not a hot restart.** `mesh_start` returns the
+> already-running node if one exists (`crates/meshffi/src/lib.rs`, `start_inner`), so a
+> Flutter hot restart re-reports the old config without rebinding the socket. Kill the app
+> and launch it again.
+>
+> To confirm the seed actually crossed into the core, read `transport:` on the Networks
+> tab. A correctly seeded iPhone shows
+> `udp/0.0.0.0:47474, seeds [10.17.158.195:47474]` — and **no** `broadcast` or
+> `multicast`. A stranded one says `no discovery path (waiting to be found)`.
 
 ---
 
@@ -201,12 +227,18 @@ its uplink unplugged, or a phone hotspot with no data, both work fine. That is t
 | Home/office Wi-Fi | Usually just works: discovery is multicast + broadcast |
 | Wi-Fi that blocks multicast (hotels, campuses, many hotspots) | Add peers by IP (below) |
 | No router at all | Turn on a phone hotspot and join every device to it |
-| iPhone | Add peers by IP; see the entitlement note above |
+| iPhone | **Always** add a peer by IP — it has no automatic discovery at all. See §3 |
 
 **Finding a laptop's IP:** `ipconfig getifaddr en0` on macOS, `hostname -I` on Linux.
 
-**Adding a peer by IP** — for the CLI, `--peer 192.168.1.42:47474`. All nodes use port
-47474 by default, so two phones on one network find each other without any of this.
+**Adding a peer by IP** — CLI: `--peer 192.168.1.42:47474`. iPhone: `--dart-define=MESH_PEERS=…`
+at build time, or **Networks → Radio → Add peer** in the app. All nodes use port 47474 by
+default, so two *Android* phones on one network find each other without any of this; an
+iPhone never does.
+
+**Only one side of a pair needs the address.** `UdpTransport::recv` records the source of
+every frame it receives into `links`, which `send_broadcast` then fans out to — so once a
+single unicast lands, the other end has learned the way back and replies unaided.
 
 ---
 
@@ -316,7 +348,8 @@ through, because every node forwards for its neighbours.
 | "The mesh core did not start" | The Rust library was not built for this platform. Run `./scripts/build_ffi.sh macos` / `android` / `ios`. |
 | App runs, no peers ever appear | Devices on different Wi-Fi networks, or the network blocks multicast. Add the other device by IP. |
 | Android sees nothing | Grant **location** permission — Android gates network discovery on it. The multicast lock is acquired automatically (see `MainActivity.kt`). |
-| iPhone sees nothing | Expected without Apple's multicast entitlement. Add peers by IP. |
+| iPhone sees nothing | It has no automatic discovery — Apple gates broadcast *and* multicast. Add a peer by IP (§3), accept the Local Network prompt, and relaunch the app rather than hot-restarting. |
+| iPhone still sees nothing after adding a peer | Check `transport:` on the Networks tab. `seeds [...]` present means the config arrived and the problem is the network (client isolation, different subnet, or a firewall on the other node). `no discovery path` means the seed never reached the core. |
 | Two nodes on one machine cannot see each other | They must use different ports **and** different home directories. The CLI warns when two processes share one identity. |
 | `unsupported protocol version` | Mixed builds. Every device must run the same commit — the wire format is version 3. |
 | macOS app cannot bind a port | Another node is already on 47474. Quit it, or run the CLI on `--port 47475`. |

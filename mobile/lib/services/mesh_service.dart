@@ -27,6 +27,89 @@ String? bleErrorForRadioState(String state) => switch (state) {
       _ => null,
     };
 
+/// Whether a platform may use the automatic UDP discovery paths - multicast and
+/// broadcast - or has to be told each address it is allowed to talk to.
+///
+/// iOS gets neither, and that is not a preference. Apple gates **both** UDP multicast and
+/// UDP broadcast, sending and receiving alike, behind
+/// `com.apple.developer.networking.multicast` - a restricted entitlement granted only on
+/// application to Apple, which this build does not hold. Frames on those paths are
+/// dropped by the OS before they reach the wire, and inbound ones are dropped on receipt.
+///
+/// Leaving the switches on would not make them work. It would only make the core's own
+/// `describe()` announce `broadcast` on a transport that has no such reach - a confident
+/// wrong answer, which this codebase treats as worse than no answer at all for exactly
+/// the reason spelled out above [bleErrorForRadioState]. What Apple does leave open is
+/// plain unicast, which needs only the local-network permission, so on iOS Wi-Fi reaches
+/// the addresses it was given and nothing else.
+bool udpAutoDiscoveryDefault({required bool isIOS}) => !isIOS;
+
+/// Split a peer list into `host:port` entries, dropping blanks and `#` comments.
+///
+/// One parser for both routes in: the `--dart-define=MESH_PEERS=a,b` build flag and the
+/// saved file, which is the same list one per line.
+List<String> parsePeerList(String raw) => raw
+    .split('\n')
+    // Comments are stripped per line, before the line is split - otherwise the words of
+    // a comment survive as peers, which is a silent way to feed the core garbage.
+    .map((line) {
+      final hash = line.indexOf('#');
+      return hash < 0 ? line : line.substring(0, hash);
+    })
+    .expand((line) => line.split(RegExp(r'[,\s]+')))
+    .map((p) => p.trim())
+    .where((p) => p.isNotEmpty)
+    .toList();
+
+/// Why [value] is not a usable `host:port` peer address, or null when it is.
+///
+/// Deliberately shallow - it checks the shape, never whether anything is listening.
+/// The core parses each address itself and silently drops one it cannot read, so
+/// catching the typo here is the difference between being told about it and no feedback
+/// at all.
+String? peerAddressError(String value) {
+  final text = value.trim();
+  if (text.isEmpty) return 'enter an address like 10.17.158.195:47474';
+  // Last colon, so an IPv6 literal in brackets still splits on its port.
+  final colon = text.lastIndexOf(':');
+  if (colon <= 0 || colon == text.length - 1) {
+    return 'needs a host and a port, like 10.17.158.195:47474';
+  }
+  final port = int.tryParse(text.substring(colon + 1));
+  if (port == null || port < 1 || port > 65535) {
+    return 'the part after ":" must be a port number, like 47474';
+  }
+  return null;
+}
+
+/// The JSON handed to `mesh_start`.
+///
+/// A free function so a test can assert on the exact configuration a platform produces
+/// without binding a socket or loading the core - which matters most for iOS, whose
+/// configuration cannot be exercised on the machine that builds it.
+Map<String, dynamic> startConfigJson({
+  required String home,
+  required MeshTransport transport,
+  required String name,
+  required int port,
+  required List<String> peers,
+  required bool multicast,
+  required bool broadcast,
+}) =>
+    {
+      'home': home,
+      'transport': switch (transport) {
+        MeshTransport.bluetooth => 'ble',
+        MeshTransport.wifi => 'udp',
+        MeshTransport.all => 'all',
+      },
+      'name': name,
+      'port': port,
+      'peers': peers,
+      'multicast': multicast,
+      'broadcast': broadcast,
+    };
+
 /// Which radios the mesh is using.
 ///
 /// Phase 2D removed the choice: a device starts every radio it has. This enum survives
@@ -68,6 +151,14 @@ class MeshService extends ChangeNotifier {
   String _radioState = 'unknown';
   String _cadence = 'low_latency';
 
+  /// Where the core keeps its state. Cached from the first [init] so [addPeer] can write
+  /// beside it, and so a restart through [switchTransport] lands in the same directory
+  /// rather than jumping to the real app-support path a test was avoiding.
+  String? _homePath;
+  List<String> _seedPeers = const [];
+  bool _multicast = true;
+  bool _broadcast = true;
+
   /// The unit the reporter last used. Kept here rather than in the widget so it survives
   /// tab changes and rebuilds - nobody picks their unit twice in an emergency.
   ///
@@ -89,6 +180,19 @@ class MeshService extends ChangeNotifier {
   String? get startError => _startError;
   MeshTransport get transport => _transport;
   bool get bluetoothAvailable => BleRadio.isAvailable;
+
+  /// The `host:port` addresses this node dials directly, in the order it will try them.
+  ///
+  /// On iOS this is the entire Wi-Fi reach of the node - see [udpAutoDiscoveryDefault] -
+  /// so an empty list there is a fact worth putting on screen. Everywhere else it is
+  /// extra reach on top of discovery, and empty is the normal state.
+  List<String> get seedPeers => List.unmodifiable(_seedPeers);
+
+  /// True when the node asked the UDP transport for the automatic discovery paths.
+  bool get udpAutoDiscovery => _multicast || _broadcast;
+
+  /// True when Wi-Fi is one of the radios currently carrying the mesh.
+  bool get usingWifi => _transport != MeshTransport.bluetooth;
 
   /// True when Bluetooth is one of the radios currently carrying the mesh.
   bool get usingBluetooth =>
@@ -136,18 +240,23 @@ class MeshService extends ChangeNotifier {
 
   // ------------------------------------------------------------------ lifecycle
 
+  Timer? _autoGpsTimer;
+
   /// Zero-config onboarding (plan.md §2): generate an identity, join `[default]`, done.
   /// No account, no sign-up, and nothing here touches the internet.
   /// [homeOverride], [port], [multicast] and [broadcast] exist so tests can start a real
   /// node without colliding with a node already running on this machine.
-  Timer? _autoGpsTimer;
-
+  ///
+  /// [peers] are extra `host:port` addresses to dial directly, from the build's
+  /// `--dart-define=MESH_PEERS=...`. Anything saved on the device by [addPeer] is merged
+  /// in behind them. [multicast] and [broadcast] default per platform - see
+  /// [udpAutoDiscoveryDefault], which is why they are nullable rather than `true`.
   Future<void> init({
     List<String> peers = const [],
     String? homeOverride,
     int port = 47474,
     bool? multicast,
-    bool broadcast = true,
+    bool? broadcast,
     String? name,
     MeshTransport transport = MeshTransport.all,
   }) async {
@@ -189,29 +298,27 @@ class MeshService extends ChangeNotifier {
       _transport = wantBle && _bleError == null
           ? (transport == MeshTransport.all ? MeshTransport.all : MeshTransport.bluetooth)
           : MeshTransport.wifi;
-      final String homePath;
-      if (homeOverride != null) {
-        homePath = homeOverride;
-      } else {
-        final dir = await getApplicationSupportDirectory();
-        homePath = '${dir.path}/reunite';
-      }
-      final home = Directory(homePath);
-      if (!home.existsSync()) home.createSync(recursive: true);
+      final homePath = await _resolveHome(homeOverride);
 
-      final reply = _ffi.start({
-        'home': home.path,
-        'transport': switch (_transport) {
-          MeshTransport.bluetooth => 'ble',
-          MeshTransport.wifi => 'udp',
-          MeshTransport.all => 'all',
-        },
-        'name': name ?? _defaultName(),
-        'port': port,
-        'peers': peers,
-        'multicast': multicast ?? !Platform.isIOS,
-        'broadcast': broadcast,
-      });
+      // The build's peers first, then anything typed into the Radio panel on an earlier
+      // run. Both routes exist because the compile-time one is all there is before the
+      // app has ever been on the phone, and it is gone the moment somebody else builds.
+      final saved = _readStoredPeers(homePath);
+      _seedPeers = [...peers, ...saved.where((p) => !peers.contains(p))];
+
+      final auto = udpAutoDiscoveryDefault(isIOS: Platform.isIOS);
+      _multicast = multicast ?? auto;
+      _broadcast = broadcast ?? auto;
+
+      final reply = _ffi.start(startConfigJson(
+        home: homePath,
+        transport: _transport,
+        name: name ?? _defaultName(),
+        port: port,
+        peers: _seedPeers,
+        multicast: _multicast,
+        broadcast: _broadcast,
+      ));
 
       if (reply['type'] == 'error') {
         _startError = reply['message'] as String? ?? 'unknown error';
@@ -252,6 +359,69 @@ class MeshService extends ChangeNotifier {
     _call({'cmd': 'set_location', 'lat': fix.$1, 'lon': fix.$2});
     _call({'cmd': 'share_location'});
     refresh();
+  }
+
+  // ----------------------------------------------------------------- seed peers
+
+  /// The directory the core keeps its identity, contacts, networks and zones in, created
+  /// if it is not there yet.
+  Future<String> _resolveHome([String? override]) async {
+    final cached = _homePath;
+    if (override == null && cached != null) return cached;
+    final path =
+        override ?? '${(await getApplicationSupportDirectory()).path}/reunite';
+    final dir = Directory(path);
+    if (!dir.existsSync()) dir.createSync(recursive: true);
+    _homePath = path;
+    return path;
+  }
+
+  /// Peers the user typed in, one `host:port` per line.
+  ///
+  /// A plain text file beside the core's own state rather than a preferences plugin:
+  /// `shared_preferences` would be a new dependency, and an offline-first app taking on
+  /// another package to store one line is a bad trade.
+  File _peersFile(String home) => File('$home/peers.txt');
+
+  List<String> _readStoredPeers(String home) {
+    try {
+      final file = _peersFile(home);
+      if (!file.existsSync()) return const [];
+      return parsePeerList(file.readAsStringSync());
+    } catch (e) {
+      // A peer list we cannot read costs the peers, never the node.
+      debugPrint('could not read saved peers: $e');
+      return const [];
+    }
+  }
+
+  /// Save a `host:port` address for this node to dial directly. Returns an error string,
+  /// or null when it was saved.
+  ///
+  /// It reaches the transport at the **next start**, not now: seeds are handed to the UDP
+  /// socket when it binds. The UI says so rather than implying the peer is already live.
+  Future<String?> addPeer(String address) async {
+    final value = address.trim();
+    final err = peerAddressError(value);
+    if (err != null) return err;
+    if (_seedPeers.contains(value)) return null;
+    return _writePeers([..._seedPeers, value]);
+  }
+
+  /// Forget a saved peer. A typo nobody can delete is a trap, so this exists.
+  Future<String?> removePeer(String address) =>
+      _writePeers(_seedPeers.where((p) => p != address).toList());
+
+  Future<String?> _writePeers(List<String> peers) async {
+    try {
+      final home = await _resolveHome();
+      _peersFile(home).writeAsStringSync(peers.isEmpty ? '' : '${peers.join('\n')}\n');
+      _seedPeers = peers;
+      notifyListeners();
+      return null;
+    } catch (e) {
+      return 'could not save the peer list: $e';
+    }
   }
 
   String _defaultName() {

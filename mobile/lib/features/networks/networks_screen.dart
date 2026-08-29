@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
@@ -217,6 +219,10 @@ class _NetworkTile extends StatelessWidget {
 /// internet. Bluetooth needs no infrastructure whatsoever, which is the case that matters
 /// when there is nothing left standing - but it is phone-to-phone only, because laptops
 /// cannot advertise as BLE peripherals from userspace.
+///
+/// It is also where Wi-Fi peers are added. On a platform that cannot use broadcast or
+/// multicast discovery, an address typed in here is the only way a device is ever
+/// reached, so the panel that reports the radios is also the one that configures them.
 class _TransportPicker extends StatelessWidget {
   final MeshService mesh;
   const _TransportPicker({required this.mesh});
@@ -292,11 +298,126 @@ class _TransportPicker extends StatelessWidget {
                   style: const TextStyle(fontSize: 11, color: Colors.grey),
                 ),
               ],
+              if (mesh.usingWifi) ...[
+                const Divider(height: 14),
+                _DiagLine(
+                  label: 'Wi-Fi discovery',
+                  value: mesh.udpAutoDiscovery
+                      ? 'broadcast and multicast'
+                      : 'off - direct peers only',
+                  warn: !mesh.udpAutoDiscovery && mesh.seedPeers.isEmpty,
+                ),
+                _DiagLine(
+                  label: 'Direct peers',
+                  value: mesh.seedPeers.isEmpty
+                      ? 'none configured'
+                      : mesh.seedPeers.join(', '),
+                  warn: !mesh.udpAutoDiscovery && mesh.seedPeers.isEmpty,
+                ),
+                const SizedBox(height: 6),
+                Text(_wifiReach(mesh),
+                    style: const TextStyle(fontSize: 11, color: Colors.grey)),
+                Wrap(
+                  spacing: 6,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  children: [
+                    for (final peer in mesh.seedPeers)
+                      InputChip(
+                        label: Text(peer,
+                            style: const TextStyle(fontSize: 11, fontFamily: 'monospace')),
+                        visualDensity: VisualDensity.compact,
+                        onDeleted: () => _forget(context, peer),
+                      ),
+                    TextButton.icon(
+                      icon: const Icon(Icons.add_link, size: 18),
+                      label: const Text('Add peer'),
+                      onPressed: () => _promptPeer(context),
+                    ),
+                  ],
+                ),
+              ],
             ],
           ),
         ),
       ],
     );
+  }
+
+  /// What Wi-Fi can reach, as configuration rather than diagnosis.
+  ///
+  /// It never says why the peer count is zero - it says what this node is set up to
+  /// reach and whether anything is in that list. "Nobody is out there" and "there is no
+  /// way to find anybody" are different problems, and only the second is knowable here.
+  ///
+  /// Only iOS is told *why* discovery is off, because only there is the reason known:
+  /// Apple gates UDP broadcast and multicast behind an entitlement this build does not
+  /// hold. Everywhere else it is off because the node was started that way, and naming a
+  /// cause we do not have would be the same guess [bleErrorForRadioState] refuses to make.
+  String _wifiReach(MeshService mesh) {
+    if (mesh.udpAutoDiscovery) {
+      return 'Devices on the same Wi-Fi or hotspot are found automatically. Add an '
+          'address to also reach one across a network that filters discovery.';
+    }
+    final why = Platform.isIOS
+        ? 'iOS does not let this app send or receive Wi-Fi broadcast or multicast, so '
+            'discovery is off.'
+        : 'This node was started without Wi-Fi broadcast or multicast discovery.';
+    if (mesh.seedPeers.isEmpty) {
+      return '$why Wi-Fi therefore reaches only addresses added here, and none are '
+          'configured. Add the other device\'s address, e.g. 10.17.158.195:47474.';
+    }
+    return '$why Wi-Fi reaches only the addresses listed here. A peer added now is '
+        'dialled the next time the app starts.';
+  }
+
+  Future<void> _promptPeer(BuildContext context) async {
+    final controller = TextEditingController();
+    final address = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Add a Wi-Fi peer'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            TextField(
+              controller: controller,
+              autofocus: true,
+              decoration: const InputDecoration(hintText: '10.17.158.195:47474'),
+            ),
+            const SizedBox(height: 10),
+            const Text(
+              'The address and port of a device already running ReUnite. Only one side '
+              'needs it: as soon as a frame lands, the other device learns this address '
+              'and answers on its own.',
+              style: TextStyle(fontSize: 11, color: Colors.grey),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(dialogContext), child: const Text('Cancel')),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, controller.text.trim()),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    if (address == null || address.isEmpty) return;
+    final err = await mesh.addPeer(address);
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(err ??
+          'Saved $address. It is dialled the next time the app starts.'),
+    ));
+  }
+
+  Future<void> _forget(BuildContext context, String peer) async {
+    final err = await mesh.removePeer(peer);
+    if (err != null && context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(err)));
+    }
   }
 }
 

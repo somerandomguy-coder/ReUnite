@@ -160,6 +160,74 @@ void main() {
     expect(formatAge(3 * 3600000), '3h ago');
   });
 
+  test('iOS is given neither UDP broadcast nor multicast, because it may not have them',
+      () {
+    // Apple gates both paths, sending and receiving, behind
+    // com.apple.developer.networking.multicast - a restricted entitlement this build does
+    // not hold, so those frames never reach the wire. Asking for them anyway would only
+    // make the core's describe() advertise reach the transport does not have.
+    expect(udpAutoDiscoveryDefault(isIOS: true), isFalse);
+    expect(udpAutoDiscoveryDefault(isIOS: false), isTrue);
+  });
+
+  test('the start config an iPhone sends has discovery off and keeps every seed', () {
+    final config = startConfigJson(
+      home: '/tmp/reunite',
+      transport: MeshTransport.all,
+      name: 'iphone',
+      port: 47474,
+      peers: const ['10.17.158.195:47474'],
+      multicast: udpAutoDiscoveryDefault(isIOS: true),
+      broadcast: udpAutoDiscoveryDefault(isIOS: true),
+    );
+    expect(config['broadcast'], isFalse);
+    expect(config['multicast'], isFalse);
+    // Unicast to an address it was given is the whole of the iPhone's Wi-Fi reach, so
+    // the seed list has to survive the crossing intact.
+    expect(config['peers'], const ['10.17.158.195:47474']);
+    expect(config['transport'], 'all');
+    expect(config['port'], 47474);
+
+    // The same call on a laptop keeps the discovery it can actually use.
+    final onMac = startConfigJson(
+      home: '/tmp/reunite',
+      transport: MeshTransport.all,
+      name: 'mac',
+      port: 47474,
+      peers: const [],
+      multicast: udpAutoDiscoveryDefault(isIOS: false),
+      broadcast: udpAutoDiscoveryDefault(isIOS: false),
+    );
+    expect(onMac['broadcast'], isTrue);
+    expect(onMac['multicast'], isTrue);
+  });
+
+  test('a peer list reads the same from a --dart-define and from the saved file', () {
+    // --dart-define=MESH_PEERS=a,b
+    expect(parsePeerList('10.17.158.195:47474,192.168.1.42:47474'),
+        ['10.17.158.195:47474', '192.168.1.42:47474']);
+    // ...and the file the Radio panel writes, one per line, comments allowed.
+    expect(parsePeerList('# saved peers\n10.17.158.195:47474\n192.168.1.42:47474\n'),
+        ['10.17.158.195:47474', '192.168.1.42:47474']);
+    expect(parsePeerList(''), isEmpty);
+    expect(parsePeerList('  ,  \n'), isEmpty);
+  });
+
+  test('an address that is not host:port is refused before the core drops it in silence',
+      () {
+    expect(peerAddressError('10.17.158.195:47474'), isNull);
+    expect(peerAddressError('  10.17.158.195:47474  '), isNull);
+    expect(peerAddressError('[fe80::1]:47474'), isNull);
+
+    // The core parses seeds with filter_map(..ok()), so a typo costs the peer and says
+    // nothing at all. This is the only place a person finds out.
+    expect(peerAddressError('10.17.158.195'), contains('port'));
+    expect(peerAddressError('10.17.158.195:'), contains('port'));
+    expect(peerAddressError('10.17.158.195:47474x'), contains('port'));
+    expect(peerAddressError('10.17.158.195:99999'), contains('port'));
+    expect(peerAddressError('   '), isNotNull);
+  });
+
   test('only a state the platform reported may accuse the radio', () {
     // The states the platform actually asserted.
     expect(bleErrorForRadioState('off'), contains('turned off'));
