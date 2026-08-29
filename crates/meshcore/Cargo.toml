@@ -30,4 +30,5 @@ bluer = { version = "0.17", features = ["full"] }
 
 [dev-dependencies]
 bincode.workspace = true
+tempfile = "3.8"
 
