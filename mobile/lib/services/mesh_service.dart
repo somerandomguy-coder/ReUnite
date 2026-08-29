@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:geolocator/geolocator.dart';
+import 'rust_mesh_ffi.dart';
 
 enum MessageType { text, location, sos }
 enum MessageStatus { sending, relayed, delivered }
@@ -86,6 +87,21 @@ class MeshService extends ChangeNotifier {
 
   Future<void> init() async {
     _isScanning = true;
+
+    // Attempt native Rust meshcore FFI binding
+    bool rustLoaded = RustMeshFFI.loadLibrary();
+    if (rustLoaded) {
+      try {
+        final res = RustMeshFFI.initNode("/tmp/reunite_mobile", "Android-Self");
+        if (res != null && res["status"] == "ok") {
+          _nodeId = res["nodeId"] ?? _nodeId;
+          debugPrint("[MeshService] Native Rust node actor started with ID: $_nodeId");
+        }
+      } catch (e) {
+        debugPrint("[MeshService] Rust FFI init warning: $e");
+      }
+    }
+
     _peers.clear();
     _peers.add(PeerNode(
       id: "peer-a2fdb802",
