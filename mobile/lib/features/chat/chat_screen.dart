@@ -12,6 +12,19 @@ class ChatScreen extends StatefulWidget {
 
 class _ChatScreenState extends State<ChatScreen> {
   final TextEditingController _textController = TextEditingController();
+  final ScrollController _scrollController = ScrollController();
+
+  void _scrollToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_scrollController.hasClients) {
+        _scrollController.animateTo(
+          _scrollController.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeOut,
+        );
+      }
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -19,7 +32,16 @@ class _ChatScreenState extends State<ChatScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: Text('Emergency Mesh [${meshService.activeNetwork}]'),
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Mesh Chat [${meshService.activeNetwork}]', style: const TextStyle(fontSize: 16)),
+            Text(
+              'Node: ${meshService.nodeId} • ${meshService.peers.length} Peers Active',
+              style: const TextStyle(fontSize: 11, color: Colors.cyanAccent),
+            ),
+          ],
+        ),
         actions: [
           IconButton(
             icon: const Icon(Icons.info_outline),
@@ -28,7 +50,10 @@ class _ChatScreenState extends State<ChatScreen> {
                 context: context,
                 builder: (_) => Container(
                   padding: const EdgeInsets.all(16),
-                  child: Text('Node ID: ${meshService.nodeId}\nTransport: BLE / P2P Mesh'),
+                  child: Text(
+                    'Node ID: ${meshService.nodeId}\nNetwork: ${meshService.activeNetwork}\nTransport: BLE Multi-Hop P2P Mesh\nActive Peers: ${meshService.peers.length}',
+                    style: const TextStyle(fontSize: 14),
+                  ),
                 ),
               );
             },
@@ -37,16 +62,34 @@ class _ChatScreenState extends State<ChatScreen> {
       ),
       body: Column(
         children: [
+          // Android BLE Mesh Status Indicator Banner
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            color: Colors.cyan.shade900.withOpacity(0.4),
+            child: Row(
+              children: [
+                const Icon(Icons.bluetooth_searching, color: Colors.cyanAccent, size: 16),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'BLE Mesh Active • ${meshService.peers.length} Direct Peers Connected',
+                    style: const TextStyle(color: Colors.cyanAccent, fontSize: 12),
+                  ),
+                ),
+              ],
+            ),
+          ),
           Expanded(
             child: meshService.messages.isEmpty
                 ? const Center(
                     child: Text(
-                      'No messages yet in [default]\nType a message or tap 📍 to share GPS over BLE',
+                      'No messages yet in [default]\nType a message, tap quick chips, or tap 📍 for GPS',
                       textAlign: TextAlign.center,
                       style: TextStyle(color: Colors.grey),
                     ),
                   )
                 : ListView.builder(
+                    controller: _scrollController,
                     padding: const EdgeInsets.all(12),
                     itemCount: meshService.messages.length,
                     itemBuilder: (context, index) {
@@ -54,6 +97,46 @@ class _ChatScreenState extends State<ChatScreen> {
                       return MessageBubble(message: msg);
                     },
                   ),
+          ),
+          // Quick Response Chips Bar
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            child: Row(
+              children: [
+                ActionChip(
+                  label: const Text('👍 I am Safe'),
+                  onPressed: () {
+                    meshService.sendMessage('👍 Status: I am safe');
+                    _scrollToBottom();
+                  },
+                ),
+                const SizedBox(width: 6),
+                ActionChip(
+                  label: const Text('💧 Need Water'),
+                  onPressed: () {
+                    meshService.sendMessage('💧 Status: Need drinking water');
+                    _scrollToBottom();
+                  },
+                ),
+                const SizedBox(width: 6),
+                ActionChip(
+                  label: const Text('🏥 Need Medical Aid'),
+                  onPressed: () {
+                    meshService.sendMessage('🏥 Status: Need medical assistance');
+                    _scrollToBottom();
+                  },
+                ),
+                const SizedBox(width: 6),
+                ActionChip(
+                  label: const Text('⛺ Safe Shelter'),
+                  onPressed: () {
+                    meshService.sendMessage('⛺ Status: Located safe shelter');
+                    _scrollToBottom();
+                  },
+                ),
+              ],
+            ),
           ),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 8.0, vertical: 4.0),
@@ -71,6 +154,7 @@ class _ChatScreenState extends State<ChatScreen> {
                       ),
                     );
                     await meshService.shareCurrentLocation();
+                    _scrollToBottom();
                   },
                 ),
                 Expanded(
@@ -83,6 +167,7 @@ class _ChatScreenState extends State<ChatScreen> {
                     onSubmitted: (val) {
                       meshService.sendMessage(val);
                       _textController.clear();
+                      _scrollToBottom();
                     },
                   ),
                 ),
@@ -91,6 +176,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   onPressed: () {
                     meshService.sendMessage(_textController.text);
                     _textController.clear();
+                    _scrollToBottom();
                   },
                 ),
               ],

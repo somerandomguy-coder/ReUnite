@@ -26,15 +26,37 @@ class MessageBubble extends StatelessWidget {
           crossAxisAlignment:
               message.isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
           children: [
-            if (!message.isMe)
-              Text(
-                message.senderName,
-                style: const TextStyle(
-                  color: Colors.cyan,
-                  fontSize: 12,
-                  fontWeight: FontWeight.bold,
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (!message.isMe) ...[
+                  Text(
+                    message.senderName,
+                    style: const TextStyle(
+                      color: Colors.cyan,
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                ],
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: Colors.black26,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Text(
+                    message.hops == 1 ? '1 hop (direct)' : '${message.hops} hops',
+                    style: const TextStyle(
+                      color: Colors.white70,
+                      fontSize: 10,
+                    ),
+                  ),
                 ),
-              ),
+              ],
+            ),
+            const SizedBox(height: 4),
             if (isLocation) ...[
               const Row(
                 mainAxisSize: MainAxisSize.min,
@@ -66,9 +88,26 @@ class MessageBubble extends StatelessWidget {
                 style: const TextStyle(color: Colors.white, fontSize: 15),
               ),
             const SizedBox(height: 4),
-            Text(
-              message.timestamp,
-              style: const TextStyle(color: Colors.white54, fontSize: 10),
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  message.timestamp,
+                  style: const TextStyle(color: Colors.white54, fontSize: 10),
+                ),
+                if (message.isMe) ...[
+                  const SizedBox(width: 4),
+                  Icon(
+                    message.status == MessageStatus.delivered
+                        ? Icons.done_all
+                        : Icons.done,
+                    color: message.status == MessageStatus.delivered
+                        ? Colors.cyanAccent
+                        : Colors.white54,
+                    size: 14,
+                  ),
+                ],
+              ],
             ),
           ],
         ),
