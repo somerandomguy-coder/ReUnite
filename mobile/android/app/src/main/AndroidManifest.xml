@@ -1,5 +1,5 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.reunite.app">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
 
     <!-- Location permissions for offline GPS & BLE scanning -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
