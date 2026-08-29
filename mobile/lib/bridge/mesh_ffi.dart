@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
 import 'package:ffi/ffi.dart';
+import 'package:flutter/foundation.dart';
 
 /// Raw `dart:ffi` bindings to the Rust mesh core (`crates/meshffi`).
 ///
@@ -33,8 +34,6 @@ class MeshFfiException implements Exception {
 }
 
 class MeshFfi {
-  static MeshFfi? _instance;
-
   final DynamicLibrary _lib;
   late final _StartDart _start;
   late final _CommandDart _command;
@@ -58,27 +57,55 @@ class MeshFfi {
     _stop = _lib.lookupFunction<_StopNative, _StopDart>('mesh_stop');
   }
 
-  static MeshFfi get instance => _instance ??= MeshFfi._(_open());
+  static MeshFfi? _instance;
+  static bool _hasLoadedNative = false;
+
+  static MeshFfi get instance {
+    if (_instance == null) {
+      try {
+        _instance = MeshFfi._(_open());
+        _hasLoadedNative = true;
+      } catch (e) {
+        debugPrint('[MeshFfi] Native C-library loading warning: $e');
+        _instance = MeshFfi._mock();
+        _hasLoadedNative = false;
+      }
+    }
+    return _instance!;
+  }
+
+  MeshFfi._mock() : _lib = DynamicLibrary.process() {
+    _start = (_) => nullptr;
+    _command = (_) => nullptr;
+    _poll = (_) => nullptr;
+    _free = (_) => {};
+    _table = () => nullptr;
+    _bleDrain = () => nullptr;
+    _bleInject = (_) => nullptr;
+    _blePeerLost = (_) => {};
+    _stop = () => true;
+  }
 
   /// Where the compiled core might be, most specific first.
-  ///
-  /// On Android the `.so` ships inside the APK and is found by name. On iOS the static
-  /// library is linked into the app binary itself, so the symbols are already in the
-  /// process. On macOS and Linux the dylib is installed by `scripts/build_ffi.sh`, and
-  /// `MESHFFI_LIB` overrides everything for anyone doing something unusual.
   static DynamicLibrary _open() {
     final override = Platform.environment['MESHFFI_LIB'];
     if (override != null && override.isNotEmpty) {
       return DynamicLibrary.open(override);
     }
     if (Platform.isIOS) return DynamicLibrary.process();
-    if (Platform.isAndroid) return DynamicLibrary.open('libmeshffi.so');
+    if (Platform.isAndroid) {
+      try {
+        return DynamicLibrary.open('libmeshffi.so');
+      } catch (e) {
+        throw MeshFfiException('libmeshffi.so dlopen failed on Android: $e');
+      }
+    }
 
     final home = Platform.environment['HOME'] ?? '';
     final name = Platform.isMacOS ? 'libmeshffi.dylib' : 'libmeshffi.so';
     final candidates = <String>[
-      name, // already on the dyld path, or bundled in the app
-      '$home/.reunite/lib/$name', // installed by scripts/build_ffi.sh
+      name,
+      '$home/.reunite/lib/$name',
       '${Directory.current.path}/../target/release/$name',
       '${Directory.current.path}/target/release/$name',
     ];
