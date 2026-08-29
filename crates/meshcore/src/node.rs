@@ -13,6 +13,8 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Result};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::battery;
+use crate::beacon;
 use crate::crypto;
 use crate::geo::haversine_m;
 use crate::identity::Identity;
@@ -24,9 +26,13 @@ use crate::router::Router;
 use crate::store::{self, Contact, StoredMessage};
 use crate::types::{now_ms, Gps, MsgId, NetworkId, NodeId};
 use crate::transport::Transport;
+use crate::zones::{self, ZoneBook, ZoneView};
 
 const OUTBOX_RETRY_MS: u64 = 15_000;
 const OUTBOX_EXPIRY_MS: u64 = 120_000;
+/// SOS is the one packet class allowed to be noisy: it gets a longer TTL than anything
+/// else so it crosses a mesh that ordinary chat would not (plan.md §4 step 1.4).
+const SOS_TTL: u8 = 12;
 
 // --------------------------------------------------------------------- config
 
@@ -39,6 +45,11 @@ pub struct NodeConfig {
     pub hello_interval: Duration,
     pub ping_interval: Duration,
     pub maintenance_interval: Duration,
+    /// Force the advertised battery level. Keeps demos and tests deterministic, and lets
+    /// a laptop on mains power still show a number.
+    pub battery_override: Option<u8>,
+    /// H3 resolution used to aggregate safety reports.
+    pub zone_resolution: u8,
 }
 
 impl NodeConfig {
@@ -51,6 +62,8 @@ impl NodeConfig {
             hello_interval: Duration::from_secs(3),
             ping_interval: Duration::from_secs(10),
             maintenance_interval: Duration::from_secs(5),
+            battery_override: None,
+            zone_resolution: zones::DEFAULT_RESOLUTION,
         }
     }
 }
@@ -75,6 +88,13 @@ pub enum Command {
     SetLocation { lat: f64, lon: f64 },
     ShareLocation,
     SetLinkFilter(Vec<String>),
+    /// Raise or clear the in-network SOS. Never touches OS emergency services.
+    Sos(bool),
+    /// Broadcast a pre-canned panic message. `0` clears it.
+    SetStatus { code: u8 },
+    /// Submit a safety report; snapped to an H3 cell before it goes anywhere.
+    ReportZone { lat: f64, lon: f64, level: u8 },
+    Heatmap,
 }
 
 #[derive(Clone, Debug)]
@@ -85,6 +105,7 @@ pub enum Reply {
     Routes(Vec<RouteView>),
     History(Vec<StoredMessage>),
     Whoami(WhoamiView),
+    Heatmap(Vec<ZoneView>),
 }
 
 #[derive(Clone, Debug)]
@@ -99,6 +120,14 @@ pub struct PeerView {
     pub gps: Option<Gps>,
     pub last_seen_ms: u64,
     pub in_current_network: bool,
+    /// Charge 0..=100 as last advertised, `None` if they never said.
+    pub battery: Option<u8>,
+    /// Last pre-canned status code (`status.rs`).
+    pub status: Option<u8>,
+    pub sos: bool,
+    /// No route and no direct link, but we still hold their last position and timestamp.
+    /// plan.md §3.2: a node whose battery died must not silently vanish from the map.
+    pub ghost: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -132,6 +161,10 @@ pub struct WhoamiView {
     pub network: String,
     pub location: Option<Gps>,
     pub link_filter: Vec<NodeId>,
+    pub sos: bool,
+    pub status: Option<u8>,
+    pub battery: Option<u8>,
+    pub zone_resolution: u8,
 }
 
 #[derive(Clone, Debug)]
@@ -169,6 +202,30 @@ pub enum Event {
     Delivered {
         to: String,
         preview: String,
+    },
+    /// Someone published a pre-canned panic message.
+    StatusUpdate {
+        id: NodeId,
+        display: String,
+        code: u8,
+    },
+    /// In-network SOS raised. Local mesh only - never emergency services.
+    SosRaised {
+        id: NodeId,
+        display: String,
+        gps: Option<Gps>,
+        distance_m: Option<f64>,
+    },
+    SosCleared {
+        id: NodeId,
+        display: String,
+    },
+    /// A safe-zone cell changed level or gained a verifier.
+    ZoneUpdate {
+        cell: u64,
+        level: u8,
+        consensus: u8,
+        from: String,
     },
     /// The active network changed; the CLI repaints its prompt from this.
     Context(String),
@@ -226,6 +283,17 @@ pub struct Node {
     location: Option<Gps>,
     outbox: Vec<Pending>,
     events: mpsc::Sender<Event>,
+    /// Our own in-network SOS flag; mirrored into every Hello and Beacon.
+    sos: bool,
+    /// Our own pre-canned status code, `None` when cleared.
+    status: Option<u8>,
+    zones: ZoneBook,
+    battery_override: Option<u8>,
+    zone_resolution: u8,
+    /// Beacon v1 sequence counter (`beacon.rs`), wraps at 255.
+    beacon_seq: u8,
+    /// Round-robin cursor over our own zone reports, for periodic re-gossip.
+    zone_gossip_idx: usize,
 }
 
 impl Node {
@@ -237,6 +305,7 @@ impl Node {
         let identity = Identity::load_or_create(&config.home)?;
         let contacts = store::load_contacts(&config.home)?;
         let networks = NetworkBook::load(&config.home, identity.id)?;
+        let zones = ZoneBook::load(&config.home, config.zone_resolution)?;
         let mut router = Router::new(identity.id);
         router.set_link_filter(config.link_filter.clone());
 
@@ -263,6 +332,13 @@ impl Node {
             location: config.location,
             outbox: Vec::new(),
             events: event_tx,
+            sos: false,
+            status: None,
+            zones,
+            battery_override: config.battery_override,
+            zone_resolution: config.zone_resolution,
+            beacon_seq: 0,
+            zone_gossip_idx: 0,
         };
 
         tokio::spawn(node.run(
@@ -361,9 +437,71 @@ impl Node {
             x_pub: self.identity.x_public(),
             name: self.self_name.clone(),
             gps: self.location,
+            battery: self.battery_percent(),
+            sos: self.sos,
+            status: self.status,
         });
         let packet = self.make_packet(None, body, DEFAULT_TTL);
+        self.beacon_seq = self.beacon_seq.wrapping_add(1);
         self.dispatch(packet).await
+    }
+
+    /// Charge to advertise: the `--battery` override wins, else ask the platform.
+    fn battery_percent(&self) -> Option<u8> {
+        self.battery_override.or_else(battery::read_percent)
+    }
+
+    /// This node's presence as a Beacon v1 advertisement (`beacon.rs`).
+    ///
+    /// Phase 1 does not have a radio that can advertise - `plan.md` deviation D3 - so
+    /// nothing calls this on the hot path yet. It exists, and is tested, because it is
+    /// the exact payload the Phase 2 native BLE layer and the Phase 3 firmware emit, and
+    /// building the format against the real node state now is what keeps it honest.
+    pub fn presence_beacon(&self) -> beacon::Beacon {
+        let mut flags = beacon::FLAG_RELAY;
+        if self.sos {
+            flags |= beacon::FLAG_SOS;
+        }
+        if self.location.is_some() {
+            flags |= beacon::FLAG_GPS;
+        }
+        if self.status.is_some() {
+            flags |= beacon::FLAG_STATUS;
+        }
+        beacon::Beacon {
+            header: beacon::Header {
+                flags,
+                battery: self.battery_percent().unwrap_or(beacon::BATTERY_UNKNOWN),
+                seq: self.beacon_seq,
+            },
+            body: beacon::Body::Presence(beacon::Presence {
+                node: self.identity.id,
+                lat_e7: self.location.map(|g| beacon::to_e7(g.lat)).unwrap_or(0),
+                lon_e7: self.location.map(|g| beacon::to_e7(g.lon)).unwrap_or(0),
+                status: self.status.unwrap_or(crate::status::NONE),
+                hops: 0,
+                ttl: DEFAULT_TTL,
+            }),
+        }
+    }
+
+    /// One aggregated safe-zone cell as a Beacon v1 advertisement. Same reasoning as
+    /// `presence_beacon`: the format is built and tested here, the radio arrives in Phase 2.
+    pub fn zone_beacon(&self, cell: u64) -> Option<beacon::Beacon> {
+        let zone = self.zones.get(cell)?;
+        Some(beacon::Beacon {
+            header: beacon::Header {
+                flags: beacon::FLAG_RELAY,
+                battery: self.battery_percent().unwrap_or(beacon::BATTERY_UNKNOWN),
+                seq: self.beacon_seq,
+            },
+            body: beacon::Body::Zone(beacon::Zone {
+                origin: self.identity.id,
+                cell,
+                level: zone.level(),
+                consensus: zone.consensus(),
+            }),
+        })
     }
 
     async fn ping_neighbors(&mut self) -> Result<()> {
@@ -403,8 +541,18 @@ impl Node {
         dest: Option<NodeId>,
         payload: NetPayload,
     ) -> Result<MsgId> {
+        self.send_payload_ttl(network, dest, payload, DEFAULT_TTL).await
+    }
+
+    async fn send_payload_ttl(
+        &mut self,
+        network: NetworkId,
+        dest: Option<NodeId>,
+        payload: NetPayload,
+        ttl: u8,
+    ) -> Result<MsgId> {
         let body = self.seal(&network, &payload)?;
-        let packet = self.make_packet(dest, body, DEFAULT_TTL);
+        let packet = self.make_packet(dest, body, ttl);
         let id = packet.id;
         self.dispatch(packet).await?;
         Ok(id)
@@ -505,6 +653,9 @@ impl Node {
             self_name: None,
             last_seen_ms: 0,
             gps: None,
+            battery: None,
+            status: None,
+            sos: false,
         });
         entry.ed_pub = hello.ed_pub;
         entry.x_pub = hello.x_pub;
@@ -518,6 +669,14 @@ impl Node {
         if let Some(gps) = hello.gps {
             entry.gps = Some(gps);
         }
+        // A Hello is authoritative about its author's own state, so status and SOS are
+        // taken as given - that is how clearing them propagates. Battery is kept on a
+        // last-known basis because a platform that cannot read it sends None forever.
+        let sos_before = entry.sos;
+        let status_before = entry.status;
+        entry.battery = hello.battery.or(entry.battery);
+        entry.sos = hello.sos;
+        entry.status = hello.status;
         let display = entry.display();
         self.contacts_dirty = true;
 
@@ -528,6 +687,34 @@ impl Node {
 
         if is_new {
             let _ = self.events.try_send(Event::PeerJoined { id, display: display.clone() });
+        }
+        // Beacons repeat every few seconds; only a *change* is worth telling anyone about.
+        if hello.sos != sos_before {
+            let _ = self.events.try_send(if hello.sos {
+                Event::SosRaised {
+                    id,
+                    display: display.clone(),
+                    gps: hello.gps,
+                    distance_m: match (self.location, hello.gps) {
+                        (Some(mine), Some(theirs)) => Some(haversine_m(&mine, &theirs)),
+                        _ => None,
+                    },
+                }
+            } else {
+                Event::SosCleared {
+                    id,
+                    display: display.clone(),
+                }
+            });
+        }
+        if hello.status != status_before {
+            if let Some(code) = hello.status {
+                let _ = self.events.try_send(Event::StatusUpdate {
+                    id,
+                    display: display.clone(),
+                    code,
+                });
+            }
         }
         if moved {
             if let Some(gps) = hello.gps {
@@ -654,6 +841,88 @@ impl Node {
             }
             NetPayload::KickVote { target, epoch } => {
                 self.on_kick_vote(network_id, from_id, target, epoch).await?;
+            }
+            NetPayload::Status { code } => {
+                let changed = match self.contacts.get_mut(&from_id) {
+                    Some(c) => {
+                        let before = c.status;
+                        c.status = if code == crate::status::NONE {
+                            None
+                        } else {
+                            Some(code)
+                        };
+                        self.contacts_dirty = true;
+                        before != c.status
+                    }
+                    None => true,
+                };
+                if changed {
+                    if store_messages {
+                        self.store_message(
+                            &network_id,
+                            &network_name,
+                            "status",
+                            &from_id,
+                            None,
+                            crate::status::describe(code),
+                        )?;
+                    }
+                    let _ = self.events.try_send(Event::StatusUpdate {
+                        id: from_id,
+                        display: from,
+                        code,
+                    });
+                }
+            }
+            NetPayload::Sos { active, gps } => {
+                if let Some(c) = self.contacts.get_mut(&from_id) {
+                    c.sos = active;
+                    if let Some(g) = gps {
+                        c.gps = Some(g);
+                    }
+                    self.contacts_dirty = true;
+                }
+                if store_messages {
+                    self.store_message(
+                        &network_id,
+                        &network_name,
+                        "sos",
+                        &from_id,
+                        None,
+                        if active { "SOS raised" } else { "SOS cleared" },
+                    )?;
+                }
+                let _ = self.events.try_send(if active {
+                    Event::SosRaised {
+                        id: from_id,
+                        display: from,
+                        gps,
+                        distance_m: match (self.location, gps) {
+                            (Some(mine), Some(theirs)) => Some(haversine_m(&mine, &theirs)),
+                            _ => None,
+                        },
+                    }
+                } else {
+                    Event::SosCleared {
+                        id: from_id,
+                        display: from,
+                    }
+                });
+            }
+            NetPayload::Zone { cell, level } => {
+                // The reporter is the packet origin, not whoever relayed it - that is what
+                // keeps the consensus count one-per-person.
+                if self.zones.record(cell, from_id, level, packet.sent_at_ms) {
+                    self.zones.save()?;
+                    if let Some(zone) = self.zones.get(cell) {
+                        let _ = self.events.try_send(Event::ZoneUpdate {
+                            cell,
+                            level: zone.level(),
+                            consensus: zone.consensus(),
+                            from,
+                        });
+                    }
+                }
             }
         }
         Ok(())
@@ -808,6 +1077,17 @@ impl Node {
             self.contacts_dirty = false;
         }
 
+        self.gossip_zone().await;
+
+        // A safe zone six hours old is not evidence about now.
+        if self.zones.prune(now_ms()) > 0 {
+            if let Err(e) = self.zones.save() {
+                let _ = self
+                    .events
+                    .try_send(Event::Warning(format!("could not save zones: {e}")));
+            }
+        }
+
         // Retry undelivered direct messages: the route may exist now, or a relay that
         // was out of range may have wandered back in.
         let now = now_ms();
@@ -847,6 +1127,27 @@ impl Node {
                 pending.preview
             )));
         }
+    }
+
+    /// Re-publish one of our own safety reports per maintenance tick, round-robin.
+    ///
+    /// A zone report is a single broadcast, so anyone who was still starting up - or who
+    /// walked into range afterwards - would never learn it. Chat can be retried by a
+    /// human and SOS/status ride every Hello, but the heat map had no such path. One
+    /// cell per tick is bounded and cheap, and it converges a late joiner onto the whole
+    /// map. It also keeps a live node's reports fresh against the TTL, while a node that
+    /// has gone away stops refreshing and correctly ages out.
+    async fn gossip_zone(&mut self) {
+        let mine = self.zones.mine(&self.identity.id);
+        if mine.is_empty() {
+            return;
+        }
+        let (cell, level) = mine[self.zone_gossip_idx % mine.len()];
+        self.zone_gossip_idx = self.zone_gossip_idx.wrapping_add(1);
+        let net = self.current;
+        let _ = self
+            .send_payload(net, None, NetPayload::Zone { cell, level })
+            .await;
     }
 
     fn store_message(
@@ -951,6 +1252,10 @@ impl Node {
                 network: self.current_network_name(),
                 location: self.location,
                 link_filter: self.router.link_filter().iter().copied().collect(),
+                sos: self.sos,
+                status: self.status,
+                battery: self.battery_percent(),
+                zone_resolution: self.zone_resolution,
             })),
             Command::SetLocation { lat, lon } => {
                 self.location = Some(Gps {
@@ -963,6 +1268,12 @@ impl Node {
             }
             Command::ShareLocation => self.cmd_share_location().await,
             Command::SetLinkFilter(users) => self.cmd_link_filter(users),
+            Command::Sos(active) => self.cmd_sos(active).await,
+            Command::SetStatus { code } => self.cmd_status(code).await,
+            Command::ReportZone { lat, lon, level } => self.cmd_report_zone(lat, lon, level).await,
+            Command::Heatmap => Ok(Reply::Heatmap(
+                self.zones.views(&self.identity.id, now_ms()),
+            )),
         }
     }
 
@@ -1169,6 +1480,96 @@ impl Node {
         )))
     }
 
+    /// `--sos start` / `--sos stop` (plan.md §4 step 1.4).
+    ///
+    /// This is an **in-network** signal and nothing more. It raises an alert on the mesh
+    /// around you. It does not, and must never, reach the operating system's emergency
+    /// call path - plan.md §3.2 isolates the two precisely so a mesh test cannot dial
+    /// real emergency services. Do not wire this to `tel:` anything.
+    async fn cmd_sos(&mut self, active: bool) -> Result<Reply> {
+        if self.sos == active {
+            return Ok(Reply::Ok(format!(
+                "SOS is already {}",
+                if active { "active" } else { "off" }
+            )));
+        }
+        self.sos = active;
+        let net = self.current;
+        let name = self.current_network_name();
+        // Go out immediately at a longer TTL rather than waiting for the next beacon.
+        self.send_payload_ttl(
+            net,
+            None,
+            NetPayload::Sos {
+                active,
+                gps: self.location,
+            },
+            SOS_TTL,
+        )
+        .await?;
+        self.send_hello().await?;
+        Ok(Reply::Ok(if active {
+            format!(
+                "[{name}] SOS broadcast to the mesh (ttl {SOS_TTL}). This alerts nearby \
+                 nodes only - it does not call emergency services. --sos stop to clear."
+            )
+        } else {
+            format!("[{name}] SOS cleared")
+        }))
+    }
+
+    /// `--status [code|name]` - one byte on the wire, never a string (plan.md §3.2).
+    async fn cmd_status(&mut self, code: u8) -> Result<Reply> {
+        if code != crate::status::NONE && crate::status::lookup(code).is_none() {
+            bail!("unknown status code {code} - try --status with no argument for the list");
+        }
+        self.status = if code == crate::status::NONE {
+            None
+        } else {
+            Some(code)
+        };
+        let net = self.current;
+        let name = self.current_network_name();
+        self.send_payload(net, None, NetPayload::Status { code }).await?;
+        // Also fold it into the beacon, so a node that arrives later still learns it.
+        self.send_hello().await?;
+        Ok(Reply::Ok(format!(
+            "[{name}] status: {} (1 byte, code {code})",
+            crate::status::describe(code)
+        )))
+    }
+
+    /// `--report-zone [lat] [lon] [level]` (plan.md §4 step 1.5).
+    async fn cmd_report_zone(&mut self, lat: f64, lon: f64, level: u8) -> Result<Reply> {
+        if level > zones::MAX_LEVEL {
+            bail!(
+                "level must be 0..={} (0 = dangerous, {} = safe)",
+                zones::MAX_LEVEL,
+                zones::MAX_LEVEL
+            );
+        }
+        let cell = zones::cell_for(lat, lon, self.zone_resolution)?;
+        let byte = zones::level_to_byte(level);
+        let now = now_ms();
+        self.zones.record(cell, self.identity.id, byte, now);
+        self.zones.save()?;
+        let net = self.current;
+        let name = self.current_network_name();
+        self.send_payload(net, None, NetPayload::Zone { cell, level: byte })
+            .await?;
+        let (consensus, aggregate) = self
+            .zones
+            .get(cell)
+            .map(|z| (z.consensus(), z.level()))
+            .unwrap_or((1, byte));
+        Ok(Reply::Ok(format!(
+            "[{name}] reported cell {cell:x} at level {level}/{} - now {:.1}/{} with {consensus} verifying",
+            zones::MAX_LEVEL,
+            zones::byte_to_level(aggregate),
+            zones::MAX_LEVEL
+        )))
+    }
+
     fn cmd_link_filter(&mut self, users: Vec<String>) -> Result<Reply> {
         if users.is_empty() {
             self.router.set_link_filter(HashSet::new());
@@ -1207,6 +1608,9 @@ impl Node {
             .map(|c| {
                 let neighbor = self.router.neighbor(&c.id);
                 let route = self.router.route(&c.id);
+                // Unreachable, but we still hold where they were and when. plan.md §3.2:
+                // a node whose battery died stays on the map as a ghost.
+                let ghost = neighbor.is_none() && route.is_none();
                 PeerView {
                     id: c.id,
                     display: c.display(),
@@ -1221,13 +1625,19 @@ impl Node {
                     gps: c.gps,
                     last_seen_ms: c.last_seen_ms,
                     in_current_network: is_default || current_members.contains(&c.id),
+                    battery: c.battery,
+                    status: c.status,
+                    sos: c.sos,
+                    ghost,
                 }
             })
             .collect();
         // Nearest first: GPS distance when we have it, else hop count, else latency.
+        // Ghosts sort below every reachable peer regardless of how close they were.
         views.sort_by(|a, b| {
             let key = |p: &PeerView| {
                 (
+                    p.ghost as u8 as f64,
                     p.distance_m.unwrap_or(f64::MAX),
                     p.hops.unwrap_or(u8::MAX) as f64,
                     p.rtt_ms.unwrap_or(u64::MAX) as f64,

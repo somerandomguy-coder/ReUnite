@@ -2,7 +2,9 @@
 
 use meshcore::geo::format_distance;
 use meshcore::node::{Event, NetworkView, PeerView, RouteView, WhoamiView};
+use meshcore::status;
 use meshcore::store::StoredMessage;
+use meshcore::zones::{self, ZoneView};
 
 pub struct Style {
     enabled: bool,
@@ -115,6 +117,35 @@ pub fn event_line(style: &Style, event: &Event, now_ms: u64) -> String {
                 .map(|d| format!(" ({} away)", format_distance(d)))
                 .unwrap_or_default()
         )),
+        Event::StatusUpdate { display, code, .. } => {
+            style.yellow(&format!("* {display}: {}", status::describe(*code)))
+        }
+        Event::SosRaised {
+            display,
+            gps,
+            distance_m,
+            ..
+        } => style.red(&format!(
+            "!! SOS from {display}{}{} - mesh alert only, emergency services were NOT called",
+            gps.map(|g| format!(" at {:.5}, {:.5}", g.lat, g.lon))
+                .unwrap_or_default(),
+            distance_m
+                .map(|d| format!(" ({} away)", format_distance(d)))
+                .unwrap_or_default()
+        )),
+        Event::SosCleared { display, .. } => {
+            style.green(&format!("SOS cleared by {display}"))
+        }
+        Event::ZoneUpdate {
+            cell,
+            level,
+            consensus,
+            from,
+        } => style.yellow(&format!(
+            "# zone {cell:x} is now {:.1}/{} safe, {consensus} verifying (via {from})",
+            zones::byte_to_level(*level),
+            zones::MAX_LEVEL
+        )),
         Event::Delivered { to, preview } => {
             style.dim(&format!("\u{2713} delivered to {to}: \"{preview}\""))
         }
@@ -134,15 +165,31 @@ pub fn peers_table(style: &Style, peers: &[PeerView], now_ms: u64) -> String {
     }
     let mut out = String::new();
     out.push_str(&style.bold(&format!(
-        "{:<18} {:<16} {:<7} {:<6} {:<8} {:<10} {:<7} {}\n",
-        "ID", "NAME", "LINK", "HOPS", "RTT", "DISTANCE", "SEEN", "NET"
+        "{:<18} {:<16} {:<8} {:<6} {:<8} {:<10} {:<6} {:<7} {}\n",
+        "ID", "NAME", "LINK", "HOPS", "RTT", "DISTANCE", "BATT", "SEEN", "NET"
     )));
+    let mut ghosts = 0;
     for p in peers {
-        out.push_str(&format!(
-            "{:<18} {:<16} {:<7} {:<6} {:<8} {:<10} {:<7} {}\n",
+        if p.ghost {
+            ghosts += 1;
+        }
+        let silent_ms = now_ms.saturating_sub(p.last_seen_ms);
+        let when = if silent_ms < 1000 {
+            "just now".to_string()
+        } else {
+            format!("{} ago", ago(silent_ms))
+        };
+        let row = format!(
+            "{:<18} {:<16} {:<8} {:<6} {:<8} {:<10} {:<6} {:<7} {}",
             p.id.to_hex(),
             truncate(&p.display, 16),
-            if p.direct { "direct" } else { "relayed" },
+            if p.ghost {
+                "ghost"
+            } else if p.direct {
+                "direct"
+            } else {
+                "relayed"
+            },
             p.hops.map(|h| h.to_string()).unwrap_or_else(|| "-".into()),
             p.rtt_ms
                 .map(|r| format!("{r}ms"))
@@ -151,11 +198,108 @@ pub fn peers_table(style: &Style, peers: &[PeerView], now_ms: u64) -> String {
             p.distance_m
                 .map(format_distance)
                 .unwrap_or_else(|| "-".into()),
+            p.battery
+                .map(|b| format!("{b}%"))
+                .unwrap_or_else(|| "-".into()),
             ago(now_ms.saturating_sub(p.last_seen_ms)),
             if p.in_current_network { "yes" } else { "-" }
+        );
+        // Ghosts are dimmed rather than dropped: where someone was last seen is the
+        // whole point of the map when their battery has died.
+        out.push_str(&if p.ghost { style.dim(&row) } else { row });
+        out.push('\n');
+        // plan.md §3.2 "Last Known Location" ghosting: a node whose battery died is not
+        // gone, it is somewhere. Say where, and how stale that is.
+        if p.ghost {
+            let pos = p
+                .gps
+                .map(|g| format!(" at {:.5}, {:.5}", g.lat, g.lon))
+                .unwrap_or_default();
+            out.push_str(&style.dim(&format!("  last seen{pos} {when}\n")));
+        }
+        // SOS and status get their own line so neither can be lost in a wide table.
+        if p.sos {
+            out.push_str(&style.red(&format!("  !! SOS - last heard {when}\n")));
+        }
+        if let Some(code) = p.status {
+            out.push_str(&style.yellow(&format!("  * {}\n", status::describe(code))));
+        }
+    }
+    out.push_str(&style.dim(
+        "sorted nearest first (GPS distance, then hops, then latency); ghosts last",
+    ));
+    if ghosts > 0 {
+        out.push_str(&style.dim(&format!(
+            "\n{ghosts} ghost(s): unreachable now, showing their last known position"
+        )));
+    }
+    out
+}
+
+/// `--heatmap show` - aggregated safe zones (plan.md §4 step 1.5).
+///
+/// Consensus gets its own column and is never folded into the level: plan.md §3.2
+/// requires a reader see how many people verified a zone before trusting its colour.
+pub fn heatmap_table(style: &Style, zones_view: &[ZoneView]) -> String {
+    if zones_view.is_empty() {
+        return style
+            .dim("no safety reports yet - add one with --report-zone [lat] [lon] [0-4]")
+            .to_string();
+    }
+    let mut out = String::new();
+    out.push_str(&style.bold(&format!(
+        "{:<18} {:<12} {:<12} {:<10} {:<10} {:<6} {}\n",
+        "CELL", "LAT", "LON", "SAFETY", "CONSENSUS", "AGE", "MINE"
+    )));
+    for z in zones_view {
+        let level = zones::byte_to_level(z.level);
+        let bar = format!("{:<10}", format!("{:.1}/{}", level, zones::MAX_LEVEL));
+        let coloured = if level >= 3.0 {
+            style.green(&bar)
+        } else if level >= 1.5 {
+            style.yellow(&bar)
+        } else {
+            style.red(&bar)
+        };
+        // A cell one person called safe must not look like one thirty people confirmed.
+        let trust = format!(
+            "{:<10}",
+            match z.consensus {
+                0 | 1 => format!("{} (unverified)", z.consensus),
+                _ => z.consensus.to_string(),
+            }
+        );
+        let trust = match z.consensus {
+            0 | 1 => style.dim(&trust),
+            2..=3 => trust,
+            _ => style.bold(&trust),
+        };
+        out.push_str(&format!(
+            "{:<18} {:<12.5} {:<12.5} {} {} {:<6} {}\n",
+            format!("{:x}", z.cell),
+            z.lat,
+            z.lon,
+            coloured,
+            trust,
+            ago(z.age_ms),
+            if z.mine { "yes" } else { "" }
         ));
     }
-    out.push_str(&style.dim("sorted nearest first (GPS distance, then hops, then latency)"));
+    out.push_str(&style.dim(
+        "safety 0 = dangerous, 4 = safe. consensus = how many distinct nodes reported it.",
+    ));
+    out
+}
+
+/// The pre-canned panic message table (`--status` with no argument).
+pub fn status_table(style: &Style) -> String {
+    let mut out = String::new();
+    out.push_str(&style.bold("pre-canned status messages - one byte on the wire\n"));
+    for s in status::TABLE {
+        out.push_str(&format!("  {}  {:<10} {}\n", s.code, s.name, s.text));
+    }
+    out.push_str(&style.dim("  0  none       clear your status\n"));
+    out.push_str(&style.dim("usage: --status medical   (or --status 2)"));
     out
 }
 
@@ -253,6 +397,32 @@ pub fn whoami(style: &Style, w: &WhoamiView) -> String {
             .map(|g| format!("{:.5}, {:.5}", g.lat, g.lon))
             .unwrap_or_else(|| "(not set - use --set-location)".into())
     ));
+    out.push_str(&format!(
+        "{} {}\n",
+        style.bold("battery  :"),
+        w.battery
+            .map(|b| format!("{b}%"))
+            .unwrap_or_else(|| "(unknown on this platform)".into())
+    ));
+    out.push_str(&format!(
+        "{} {}\n",
+        style.bold("status   :"),
+        w.status
+            .map(|c| format!("{} (code {c})", status::describe(c)))
+            .unwrap_or_else(|| "(none)".into())
+    ));
+    if w.sos {
+        out.push_str(&format!(
+            "{} {}\n",
+            style.bold("SOS      :"),
+            style.red("ACTIVE - mesh alert only, emergency services were NOT called")
+        ));
+    }
+    out.push_str(&format!(
+        "{} H3 resolution {}\n",
+        style.bold("zones    :"),
+        w.zone_resolution
+    ));
     if !w.link_filter.is_empty() {
         out.push_str(&format!(
             "{} {}\n",
@@ -295,10 +465,21 @@ pub const HELP: &str = r#"commands (anything that does not start with -- is broa
 
   people and position
     --peers                            peers in range or reachable, nearest first
+                                       (unreachable peers stay as dimmed "ghosts" at
+                                       their last known position)
     --routes                           learned mesh routes and next hops
     --rename [id] [name]               local-only alias for a node id
     --set-location [lat] [lon]         set your GPS position
     --share-location                   push your position to the active network
+
+  emergency
+    --sos start | --sos stop           raise or clear the in-network SOS
+                                       IN-NETWORK ONLY: this alerts the mesh around you.
+                                       It does NOT call emergency services.
+    --status [code|name]               send a pre-canned 1-byte message
+                                       (--status with no argument lists them)
+    --report-zone [lat] [lon] [0-4]    report how safe a place is (0 = dangerous)
+    --heatmap show                     aggregated safe zones and how many verified each
 
   session
     --whoami                           your id, network, transport and home directory

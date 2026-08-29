@@ -7,6 +7,7 @@
 //! identity.json          this node's UUID + keys
 //! contacts.json          node id -> public keys, local alias, last GPS
 //! networks.json          private networks we belong to, including their symmetric keys
+//! zones.json             aggregated H3 safe-zone reports and their consensus counts
 //! messages/<net>.jsonl   append-only log, only when --enable-storing is on
 //! ```
 
@@ -74,6 +75,12 @@ pub struct Contact {
     pub self_name: Option<String>,
     pub last_seen_ms: u64,
     pub gps: Option<Gps>,
+    /// Charge 0..=100 as last advertised.
+    pub battery: Option<u8>,
+    /// Last pre-canned status code (`status.rs`), `None` when never set or cleared.
+    pub status: Option<u8>,
+    /// Whether their last beacon carried the in-network SOS flag.
+    pub sos: bool,
 }
 
 impl Contact {
@@ -99,6 +106,12 @@ struct ContactRecord {
     last_seen_ms: u64,
     #[serde(default)]
     gps: Option<Gps>,
+    #[serde(default)]
+    battery: Option<u8>,
+    #[serde(default)]
+    status: Option<u8>,
+    #[serde(default)]
+    sos: bool,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -127,6 +140,9 @@ pub fn load_contacts(home: &Path) -> Result<HashMap<NodeId, Contact>> {
                 self_name: rec.self_name,
                 last_seen_ms: rec.last_seen_ms,
                 gps: rec.gps,
+                battery: rec.battery,
+                status: rec.status,
+                sos: rec.sos,
             },
         );
     }
@@ -144,6 +160,9 @@ pub fn save_contacts(home: &Path, contacts: &HashMap<NodeId, Contact>) -> Result
             self_name: c.self_name.clone(),
             last_seen_ms: c.last_seen_ms,
             gps: c.gps,
+            battery: c.battery,
+            status: c.status,
+            sos: c.sos,
         })
         .collect();
     records.sort_by(|a, b| a.id.cmp(&b.id));

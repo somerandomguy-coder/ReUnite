@@ -119,20 +119,20 @@ Phase 3 crate split unchanged.
 
 ## Step 1.1 — Core node, discovery, battery telemetry
 
-- [ ] `meshcore/src/battery.rs`: `fn read_percent() -> Option<u8>`.
+- [x] `meshcore/src/battery.rs`: `fn read_percent() -> Option<u8>`.
       macOS via `pmset -g batt` / IOKit, Linux via `/sys/class/power_supply/BAT*/capacity`,
       Windows stub returning `None`. Cached for 60 s — this must never be in a hot path.
-- [ ] `NodeConfig.battery_override: Option<u8>` and `meshnet --battery <0-100>`, so demos
+- [x] `NodeConfig.battery_override: Option<u8>` and `meshnet --battery <0-100>`, so demos
       and tests are deterministic and a laptop on mains power can still show a number.
-- [ ] Include `battery` in every `Hello`; store on `Contact`; surface in `PeerView`.
-- [ ] `--peers` gains a `BATT` column; blank when unknown.
-- [ ] `beacon.rs` presence encode/decode, exact-byte unit tests.
+- [x] Include `battery` in every `Hello`; store on `Contact`; surface in `PeerView`.
+- [x] `--peers` gains a `BATT` column; blank when unknown.
+- [x] `beacon.rs` presence encode/decode, exact-byte unit tests.
 
 ## Step 1.2 — Routing and pre-canned panic messages
 
 Routing is already done. This step is the binary-packed status codes.
 
-- [ ] `meshcore/src/status.rs`: the code table, `from_str`/`describe`, `no_std`-clean.
+- [x] `meshcore/src/status.rs`: the code table, `from_str`/`describe`, `no_std`-clean.
 
 | Code | Name | Rendered |
 | :--- | :--- | :--- |
@@ -145,61 +145,60 @@ Routing is already done. This step is the binary-packed status codes.
 | `0x06` | `shelter` | Shelter here, space available |
 | `0x07` | `hazard` | Route blocked / hazard |
 
-- [ ] `Command::SetStatus { code: u8 }` → broadcasts `NetPayload::Status` on the active
+- [x] `Command::SetStatus { code: u8 }` → broadcasts `NetPayload::Status` on the active
       network **and** sets the field in subsequent `Hello`s, so a node that arrives later
       still learns it.
-- [ ] `Event::StatusUpdate { id, display, code }`; `render.rs` maps code → text.
-- [ ] CLI: `--status [code|name]` accepts `2` or `medical`. `--status` with no argument
+- [x] `Event::StatusUpdate { id, display, code }`; `render.rs` maps code → text.
+- [x] CLI: `--status [code|name]` accepts `2` or `medical`. `--status` with no argument
       lists the table.
-- [ ] `Contact.status: Option<u8>` persisted; shown in `--peers`.
+- [x] `Contact.status: Option<u8>` persisted; shown in `--peers`.
 
 ## Step 1.3 — Private networks
 
 `done` — no new work. Verification only:
 
-- [ ] Confirm `Status`, `Sos` and `Zone` payloads are all sealed inside `Envelope` and
+- [x] Confirm `Status`, `Sos` and `Zone` payloads are all sealed inside `Envelope` and
       therefore inherit private-network encryption. A node outside the network must see
       only ciphertext. Add a regression test asserting exactly that.
 
 ## Step 1.4 — In-network SOS and last-known-location ghosting
 
-- [ ] `Command::Sos { active: bool }`, CLI `--sos start` / `--sos stop`.
-- [ ] Sets `Node.sos`, which flips the `Hello` flag and the Beacon v1 SOS bit, and sends
+- [x] `Command::Sos { active: bool }`, CLI `--sos start` / `--sos stop`.
+- [x] Sets `Node.sos`, which flips the `Hello` flag and the Beacon v1 SOS bit, and sends
       `NetPayload::Sos { active, gps }` immediately rather than waiting for the next beacon.
-- [ ] SOS packets get `ttl = 12` (vs. the default 8) and skip the outbox back-off — this is
+- [x] SOS packets get `ttl = 12` (vs. the default 8) and skip the outbox back-off — this is
       the one packet class allowed to be noisy.
-- [ ] `Event::SosRaised` / `Event::SosCleared`; rendered in red, and repeated in `--peers`
+- [x] `Event::SosRaised` / `Event::SosCleared`; rendered in red, and repeated in `--peers`
       with an `SOS` marker so it cannot scroll away.
-- [ ] **Isolation from OS SOS.** `plan.md` §3.2 is explicit: this never touches the
+- [x] **Isolation from OS SOS.** `plan.md` §3.2 is explicit: this never touches the
       platform emergency-call path. Add a comment saying so at the definition site and a
       line in `--help`, so nobody later "helpfully" wires it to `tel:911`.
-- [ ] Ghosting: `PeerView` gains `ghost: bool` (true when `last_seen_ms` is older than the
+- [x] Ghosting: `PeerView` gains `ghost: bool` (true when `last_seen_ms` is older than the
       neighbour timeout but a cached GPS fix exists). `--peers` prints ghosts dimmed with
       `last seen 45m ago` instead of dropping the row. `Contact` already persists
       `gps` + `last_seen_ms`, so this is a view change, not a storage change.
-- [ ] Ghost rows sort last, below live peers.
+- [x] Ghost rows sort last, below live peers.
 
 ## Step 1.5 — Aggregated safe-zone heat map
 
-- [ ] Dependency check: `h3o` (pure Rust, Apache-2.0). Confirm it builds and whether it
-      supports `no_std`. **Fallback if it does not:** `meshcore/src/grid.rs` implementing a
-      quantised lat/lon cell id at equivalent resolution. The rest of the design is
-      unchanged either way, because everything downstream only handles an opaque `u64` cell.
-- [ ] Resolution **8** by default (≈0.46 km² per cell, ≈460 m edge) — a sensible "block"
+- [x] Dependency check: `h3o` 0.11 has a toggleable `std` feature, so it is `no_std`-capable
+      and is used with `default-features = false`. **The `grid.rs` fallback was not needed
+      and was not written.**
+- [x] Resolution **8** by default (≈0.46 km² per cell, ≈460 m edge) — a sensible "block"
       for a town. Configurable via `NodeConfig`.
-- [ ] `Command::ReportZone { lat, lon, level }`, CLI `--report-zone [lat] [lon] [level]`
+- [x] `Command::ReportZone { lat, lon, level }`, CLI `--report-zone [lat] [lon] [level]`
       with `level` 0–4 (0 = dangerous, 4 = safe), scaled to the 0–255 wire byte.
-- [ ] `meshcore/src/zones.rs`: `ZoneBook` mapping `cell → { reports: HashMap<NodeId, u8>,
+- [x] `meshcore/src/zones.rs`: `ZoneBook` mapping `cell → { reports: HashMap<NodeId, u8>,
       last_update_ms }`. **One report per node per cell**, latest wins — that is what makes
       the consensus count meaningful and stops one node inflating a zone.
-- [ ] Aggregate = mean of the per-node levels; consensus = number of distinct reporters.
-- [ ] Persisted to `zones.json` in the node home, atomically like the other state files.
-- [ ] `Command::Heatmap` → `Reply::Heatmap(Vec<ZoneView>)`, CLI `--heatmap show`,
+- [x] Aggregate = mean of the per-node levels; consensus = number of distinct reporters.
+- [x] Persisted to `zones.json` in the node home, atomically like the other state files.
+- [x] `Command::Heatmap` → `Reply::Heatmap(Vec<ZoneView>)`, CLI `--heatmap show`,
       rendered as a table: cell, centre lat/lon, level, **consensus count**, age.
       `plan.md` §3.2 requires the consensus count be displayed — the table shows it in its
       own column, never folded into the level.
-- [ ] Zones expire after 6 h and are pruned in the maintenance tick.
-- [ ] Beacon v1 type-1 encode/decode for zone gossip.
+- [x] Zones expire after 6 h and are pruned in the maintenance tick.
+- [x] Beacon v1 type-1 encode/decode for zone gossip.
 
 ---
 
@@ -210,7 +209,6 @@ new   crates/meshcore/src/beacon.rs      Beacon v1 pack/unpack (core+alloc only)
 new   crates/meshcore/src/status.rs      pre-canned code table (core+alloc only)
 new   crates/meshcore/src/zones.rs       H3 aggregation, consensus, persistence
 new   crates/meshcore/src/battery.rs     platform battery read + override
-new   crates/meshcore/src/grid.rs        only if h3o is unusable (see 1.5)
 edit  crates/meshcore/src/packet.rs      VERSION 3, Hello fields, NetPayload variants
 edit  crates/meshcore/src/node.rs        Command/Event/PeerView, SOS state, handlers
 edit  crates/meshcore/src/store.rs       Contact.status/battery, zones.json
@@ -239,6 +237,23 @@ edit  README.md, docs/ARCHITECTURE.md, docs/DEMO.md
 8. `beacon.rs`, `status.rs` and `grid.rs` compile with no `std::` import (checked by
    inspection now; enforced by the Phase 3 split).
 9. `docs/DEMO.md` gains an SOS + heat-map segment to the three-laptop script.
+
+## Outcome
+
+All nine acceptance criteria met; `cargo test` is 18/18 green and `cargo build --release`
+is warning-free. Verified live on three nodes: a two-hop SOS, a ghost surviving the
+neighbour timeout with its last fix, and a heat-map cell converging to `3.0/4` with
+`consensus = 2` after one node reported twice.
+
+Two things came out of the live runs rather than the design:
+
+* **Zone reports needed periodic re-gossip.** A one-shot broadcast is lost to the
+  startup race (a receiver drops packets from an origin whose key it has not learned yet)
+  and is invisible to anyone who joins later. SOS and status were unaffected because they
+  ride every `Hello`; the heat map had no such path. Each node now re-gossips **its own**
+  reports, one cell per maintenance tick — never the aggregate, which would compound the
+  consensus count as reports bounce around the mesh.
+* **`grid.rs` was never needed** — see 1.5.
 
 ## Risks
 

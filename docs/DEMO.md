@@ -1,8 +1,13 @@
 # Demo script
 
 A ten-minute walkthrough that shows every Phase 1 feature: discovery, multi-hop relaying,
-private networks that relays cannot read, kick voting with an automatic re-key, and
-store-and-forward delivery. Every transcript below is real output from the built binary.
+private networks that relays cannot read, kick voting with an automatic re-key,
+store-and-forward delivery, the in-network SOS, pre-canned panic messages, last-known-location
+ghosting and the aggregated safe-zone heat map. Every transcript below is real output from
+the built binary.
+
+> **Run the same build on every machine.** The protocol version is 3; a node on an older
+> build is rejected with a clear version-mismatch message rather than misbehaving.
 
 You need three nodes — three laptops, or three terminals on one machine. If you are using
 one machine, start them as in [SETUP.md §8](SETUP.md#8-several-nodes-on-one-laptop), which
@@ -26,7 +31,13 @@ network  : [default]
 transport: udp/0.0.0.0:47001
 home     : /Users/alice/.meshnet
 location : (not set - use --set-location)
+battery  : 88%
+status   : (none)
+zones    : H3 resolution 8
 ```
+
+Battery is read from the platform. Pass `--battery 42` to force a value, which is what
+keeps a demo reproducible and gives a mains-powered desktop something to advertise.
 
 Give them positions (a laptop has no GPS, so we set it by hand; on mobile this comes from
 the OS) and look around from **A**:
@@ -236,3 +247,122 @@ Everyone in the network sees it, with the distance from their own position:
 
 `--peers` then ranks people nearest-first, which is the input a mapping UI needs in
 Phase 2.
+
+
+## 8. Pre-canned panic messages
+
+A frightened person should not have to type, and the radio budget does not stretch to
+prose. Seven common things travel as **one byte**:
+
+```
+[default] > --status
+pre-canned status messages - one byte on the wire
+  1  safe       I am safe
+  2  medical    Need medical help
+  3  supplies   Need water / food
+  4  trapped    Trapped - need rescue
+  5  moving     Moving to a safe zone
+  6  shelter    Shelter here, space available
+  7  hazard     Route blocked / hazard
+  0  none       clear your status
+usage: --status medical   (or --status 2)
+
+[default] > --status medical
+[default] status: Need medical help (1 byte, code 2)
+```
+
+Everyone else sees the words, reconstructed locally:
+
+```
+* ~bob: Need medical help
+```
+
+The status also rides every `Hello`, so a node that arrives ten minutes later still learns
+it instead of having missed the one broadcast.
+
+## 9. In-network SOS
+
+On **C**, who can only be heard through relay **B**:
+
+```
+[default] > --sos start
+[default] SOS broadcast to the mesh (ttl 12). This alerts nearby nodes only - it does not
+call emergency services. --sos stop to clear.
+```
+
+On **A**, two hops away:
+
+```
+!! SOS from ~carol at 10.77690, 106.70090 - mesh alert only, emergency services were NOT called
+
+[default] > --peers
+ID                 NAME             LINK     HOPS   RTT      DISTANCE   BATT   SEEN    NET
+5fd15953d9186071   ~relay           direct   1      1ms      -          50%    1s      yes
+acfd53bb3f4e5430   ~carol           relayed  2      -        -          7%     now     yes
+  !! SOS - last heard just now
+```
+
+SOS is sent at TTL 12 instead of the usual 8 and does not wait for the next beacon — it is
+the one packet class allowed to be noisy. The dedupe cache is what stops that becoming a
+storm.
+
+**It is not the operating system's SOS.** [plan.md](../plan.md) §3.2 isolates the two
+deliberately, so that testing a mesh can never dial real emergency services.
+
+## 10. Ghosting: a dead battery is not a deletion
+
+Quit **B** entirely and wait past the 30-second neighbour timeout. B does not disappear
+from A's map:
+
+```
+[default] > --peers
+ID                 NAME             LINK     HOPS   RTT      DISTANCE   BATT   SEEN    NET
+d965fdd41a1a1940   ~bob             ghost    -      -        1.11km     3%     38s     yes
+  last seen at 10.78690, 106.70090 38s ago
+  * I am safe
+sorted nearest first (GPS distance, then hops, then latency); ghosts last
+1 ghost(s): unreachable now, showing their last known position
+```
+
+Ghosts sort below every reachable peer, keep their last GPS fix, and carry the age of that
+fix. Where someone was last seen is exactly what a search needs.
+
+## 11. The safe-zone heat map
+
+Raw coordinates would flood the network, so a report is snapped to an H3 hex cell
+(resolution 8, about a town block) and only the cell travels. On **B**:
+
+```
+[default] > --report-zone 10.7769 106.7009 4
+[default] reported cell 8865b5662bfffff at level 4/4 - now 4.0/4 with 1 verifying
+```
+
+On **C**, a few metres away — the same cell, a gloomier opinion:
+
+```
+[default] > --report-zone 10.77695 106.70095 2
+```
+
+On **A**:
+
+```
+# zone 8865b5662bfffff is now 3.0/4 safe, 2 verifying (via ~bob)
+
+[default] > --heatmap show
+CELL               LAT          LON          SAFETY     CONSENSUS  AGE    MINE
+8865b5662bfffff    10.77508     106.69941    3.0/4      2          2s
+safety 0 = dangerous, 4 = safe. consensus = how many distinct nodes reported it.
+```
+
+Two things to notice.
+
+**Consensus counts people, not reports.** Have C report the same cell again and the count
+stays at 2 — a node re-reporting replaces its own earlier opinion and can never manufacture
+agreement. A cell with only one report is printed `1 (unverified)`, because one person
+calling a street safe is not the same claim as thirty.
+
+**Late joiners converge.** Each node re-gossips one of its own reports per maintenance
+tick, so a node that starts up after the reports were made still ends up with the whole
+map. Start a fourth node now and watch its heat map fill in over the next few seconds.
+Reports expire after six hours: a node that has gone away stops refreshing and its opinion
+correctly ages out.

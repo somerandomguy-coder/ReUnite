@@ -11,9 +11,13 @@ crates/meshcore
       net.rs        networks: keys, members, invites, kick tally, re-key
       router.rs     neighbours, learned routes, duplicate suppression
       packet.rs     Frame / Packet wire format, TTL, path recording
+      beacon.rs     Beacon v1: the 27-byte BLE-advertisement format (core-only)
+      status.rs     pre-canned panic codes, one byte each (core-only)
+      zones.rs      H3 safe-zone aggregation and trust consensus
+      battery.rs    platform battery read, cached
       crypto.rs     Ed25519, X25519 sealed boxes, ChaCha20-Poly1305, HKDF
       identity.rs   persistent UUID -> node id + keys
-      store.rs      identity.json, contacts.json, networks.json, messages/*.jsonl
+      store.rs      identity.json, contacts.json, networks.json, zones.json, messages/*.jsonl
       transport/    the radio seam: udp.rs today, BLE/Wi-Fi Direct later
 ```
 
@@ -51,14 +55,40 @@ touch anything else without invalidating the signature.
 
 | Body | Purpose |
 | :--- | :--- |
-| `Hello` | 3-second beacon: Ed25519 + X25519 public keys, self-chosen name, optional GPS. Floods, so distant nodes learn keys they will need for invites. |
+| `Hello` | 3-second beacon: Ed25519 + X25519 public keys, self-chosen name, optional GPS, battery, SOS flag and current pre-canned status. Floods, so distant nodes learn keys they will need for invites. |
 | `Ping` / `Pong` | Latency probe between direct neighbours. TTL 0 — never relayed. |
 | `Envelope` | Any network traffic: `{network, epoch, nonce, ciphertext}`. |
 | `Invite` | A network key sealed to exactly one recipient. |
 
 Inside an `Envelope`, encrypted with the network key, is a `NetPayload`: `Chat`, `Direct`,
-`Gps`, `Members`, `KickVote` or `Ack`. A node that is not in the network sees only the
-envelope — which network id, which epoch, and how big — and relays it blind.
+`Gps`, `Members`, `KickVote`, `Ack`, `Status`, `Sos` or `Zone`. A node that is not in the
+network sees only the envelope — which network id, which epoch, and how big — and relays
+it blind. That includes the emergency payloads: a relay carries someone's SOS without
+being able to read it.
+
+Putting SOS and status **inside the signature of `Hello`** is deliberate. A relay can
+rewrite `ttl` and `path` and nothing else, so no intermediate node can clear someone's
+SOS flag or forge a status on their behalf.
+
+### Beacon v1 — the advertisement-sized format
+
+`Frame` is `bincode` and runs to kilobytes. A legacy BLE advertisement carries 31 bytes of
+AD payload, and a manufacturer-specific structure spends 2 on length+type and 2 on the
+company id, leaving **27 usable bytes** — so [plan.md](../plan.md) §2's requirement that
+presence, SOS, battery, GPS and heat-map data ride advertisements cannot be met by
+`Frame` at any compression. `beacon.rs` is the second format: hand-packed, fixed layout,
+no allocation.
+
+```
+header (4 bytes)   ver/type | flags (SOS, GPS, status, relay) | battery | seq
+type 0 presence    node_id(8) lat_e7(4) lon_e7(4) status(1) hops(1) ttl(1)   = 23 bytes
+type 1 zone        origin(8) cell(8) level(1) consensus(1)                   = 22 bytes
+```
+
+GPS is `i32` degrees × 1e7 (~1 cm, far finer than GPS itself). Phase 1 encodes, decodes
+and tests this format against real node state; Phase 2 is what puts it on a radio, since
+no laptop can advertise (see below). `beacon.rs` and `status.rs` import no `std`, so they
+move into the `#![no_std]` core in Phase 3 unchanged.
 
 ## Routing
 
@@ -83,7 +113,44 @@ displayed but stays empty on UDP, where there is no radio signal to read. A BLE 
 fills it in and the ranking in `--peers` starts using it.
 
 `--peers` ranks by GPS distance first, then hops, then latency — the "nearest peers first"
-requirement from [proposal.md](../proposal.md).
+requirement from [proposal.md](../proposal.md) — with ghosts always below reachable peers.
+
+## Emergency signals
+
+* **In-network SOS.** `--sos start` sets a flag that rides every `Hello` and sends an
+  immediate `Sos` payload at **TTL 12** rather than the default 8: it is the one packet
+  class allowed to be noisy, and the dedupe cache is what keeps that from becoming a
+  storm. It is isolated from the operating system's emergency-call path by design
+  ([plan.md](../plan.md) §3.2) so that testing a mesh can never dial real emergency
+  services. Nothing in this codebase may wire it to one.
+* **Pre-canned status.** Seven codes, one byte each (`status.rs`). The English text lives
+  only in the renderer and never travels — that is the point, on a link with a 27-byte
+  budget and a panicking user who should not have to type.
+* **Ghosting.** A contact with no neighbour entry and no route is not deleted; it is shown
+  dimmed at its last known GPS fix with the age of that fix. A dead battery must not look
+  the same as never having existed.
+
+## The safe-zone heat map
+
+Raw coordinates would not scale: a hundred people in one street each broadcasting a
+distinct lat/lon is a storm with no useful aggregate at the end of it. So a report is
+snapped to an **H3 cell** (resolution 8, ≈460 m edge — about a town block) and only the
+cell travels, as an 8-byte index plus a level byte.
+
+Two rules make the number mean something:
+
+* **One report per node per cell**, latest wins. Otherwise one node could shout a street
+  green fifty times and manufacture agreement.
+* **Consensus is reported separately from level.** [plan.md](../plan.md) §3.2 requires a
+  reader see how many people verified a zone *before* the red/green gradient is trusted,
+  so `--heatmap show` gives it its own column and marks a single report `(unverified)`.
+
+Reports expire after 6 hours. Each node re-gossips **its own** reports, one cell per
+5-second maintenance tick — never the aggregate, or the consensus count would compound as
+reports bounce around the mesh. That round-robin is what lets a node that joins later, or
+that was still starting up when a report went past, converge onto the whole map; it also
+keeps a live node's reports fresh against the TTL while a node that has gone away stops
+refreshing and correctly ages out.
 
 ## Identity and cryptography
 
@@ -170,5 +237,9 @@ Two mechanisms fake radio range:
   addresses you name, which is how [DEMO.md](DEMO.md) builds an A—B—C line inside one
   laptop.
 
-`cargo test` covers the sealed-box exchange, packet signing and tamper rejection, dedupe
-and route preference, the kick threshold and re-key, and persistence across restarts.
+`cargo test` (18 tests) covers the sealed-box exchange, packet signing and tamper
+rejection, dedupe and route preference, the kick threshold and re-key, persistence across
+restarts, Beacon v1 byte-exact round-trips and its size budget, status-code parsing and
+the absence of human text on the wire, H3 cell snapping, zone consensus counting people
+rather than reports, and a relay outside a private network being unable to read its SOS,
+status or zone traffic.
