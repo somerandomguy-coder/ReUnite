@@ -1,0 +1,90 @@
+# Dependency directories
+node_modules/
+jspm_packages/
+web_modules/
+
+# Production build outputs
+dist/
+build/
+out/
+.next/
+.expo/
+.output/
+
+# Testing & Coverage
+coverage/
+.vitest/
+.nyc_output/
+.cache/
+
+# Python & UV virtual environments & caches
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.uv/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Environment & Secrets
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+*.pem
+*.key
+
+# OS Generated Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE & Editor Settings
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-workspace
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# Mobile Native Build Artifacts (iOS / Android / React Native)
+ios/Pods/
+ios/build/
+ios/DerivedData/
+*.xcworkspace
+*.xcuserdata
+android/.gradle/
+android/app/build/
+android/build/
+android/captures/
+*.apk
+*.aab
+*.keystore
+!android/app/debug.keystore
+
+# Temporary & Workspace Files
+tmp/
+temp/
+.DerivedData/

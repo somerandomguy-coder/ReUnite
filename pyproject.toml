@@ -1,0 +1,14 @@
+[project]
+name = "reunite-ble-tools"
+version = "0.1.0"
+description = "P2P BLE Mesh & SOS tools for ReUnite local-first architecture"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "bleak>=0.20.0",
+    "bluez-peripheral>=0.1.7",
+    "dbus-fast>=2.0.0",
+]
+
+[tool.uv]
+dev-dependencies = []

@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Offline BLE Chat & SOS Mesh</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 16px; background: #0b0f19; color: #f1f5f9; margin: 0; }
+    .card { background: #1e293b; padding: 16px; border-radius: 12px; margin-bottom: 16px; border: 1px solid #334155; }
+    .badge { background: #22c55e; color: #052e16; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; }
+    .badge-off { background: #ef4444; color: #450a0a; }
+    button { background: #3b82f6; color: white; border: none; padding: 12px; border-radius: 8px; font-weight: bold; cursor: pointer; width: 100%; font-size: 15px; margin-top: 8px; }
+    button:active { background: #2563eb; }
+    .btn-sos { background: #dc2626; font-size: 18px; padding: 16px; box-shadow: 0 4px 14px rgba(220, 38, 38, 0.4); margin-top: 12px; }
+    .btn-sos:active { background: #b91c1c; }
+    .chat-box { background: #020617; border-radius: 8px; padding: 12px; height: 260px; overflow-y: auto; font-family: monospace; border: 1px solid #1e293b; margin-bottom: 12px; display: flex; flex-direction: column; gap: 8px; }
+    .msg { padding: 8px 12px; border-radius: 8px; max-width: 85%; font-size: 14px; word-break: break-word; }
+    .msg-out { background: #1d4ed8; align-self: flex-end; color: white; }
+    .msg-in { background: #334155; align-self: flex-start; color: #f8fafc; }
+    .msg-sos { background: #991b1b; color: white; border: 1px solid #f87171; align-self: center; text-align: center; width: 90%; font-weight: bold; }
+    .input-row { display: flex; gap: 8px; }
+    .input-row input { flex: 1; padding: 12px; background: #0f172a; border: 1px solid #334155; color: white; border-radius: 8px; font-size: 15px; }
+    .input-row button { width: 80px; margin-top: 0; }
+  </style>
+</head>
+<body>
+
+  <h2>📶 P2P BLE Chat & SOS Node</h2>
+
+  <div class="card">
+    <p style="margin: 0 0 8px 0;">Radio Status: <span class="badge badge-off" id="radio-status">DISCONNECTED</span></p>
+    <small style="color: #94a3b8;">Airplane Mode & No Wi-Fi required. Communicates over Bluetooth radio directly with Linux PC.</small>
+    <button id="btn-connect" onclick="connectBLENode()">📡 Connect to Linux Node</button>
+  </div>
+
+  <div class="card">
+    <div class="chat-box" id="chat">
+      <div class="msg msg-in">System: Tap "Connect to Linux Node" to pair over BLE radio.</div>
+    </div>
+
+    <div class="input-row">
+      <input type="text" id="msg-input" placeholder="Type offline BLE message..." disabled onkeypress="handleKey(event)">
+      <button id="btn-send" onclick="sendMessage()" disabled>Send</button>
+    </div>
+
+    <button class="btn-sos" id="btn-sos" onclick="sendSOS()" disabled>🚨 SEND SOS EMERGENCY</button>
+  </div>
+
+  <script>
+    let rxChar = null;
+    let txChar = null;
+
+    const SERVICE_UUID = "a1b2c3d4-e5f6-7890-1234-56789abcdef0";
+    const RX_CHAR_UUID = "a1b2c3d4-e5f6-7890-1234-56789abcdef1"; // Android -> Linux (Write)
+    const TX_CHAR_UUID = "a1b2c3d4-e5f6-7890-1234-56789abcdef2"; // Linux -> Android (Notify)
+
+    function appendMessage(text, type) {
+      const chat = document.getElementById('chat');
+      const div = document.createElement('div');
+      div.className = `msg ${type}`;
+      div.textContent = text;
+      chat.appendChild(div);
+      chat.scrollTop = chat.scrollHeight;
+    }
+
+    async function connectBLENode() {
+      try {
+        appendMessage("Filtering for BitChat BLE Service UUID...", "msg-in");
+        
+        // Filter specifically for our P2P Chat Service UUID so ONLY BitChat-Linux appears!
+        const device = await navigator.bluetooth.requestDevice({
+          filters: [{ services: [SERVICE_UUID] }]
+        });
+
+        appendMessage(`Selected: ${device.name || 'BitChat Node'} (${device.id}). Connecting GATT...`, "msg-in");
+        const server = await device.gatt.connect();
+        const service = await server.getPrimaryService(SERVICE_UUID);
+
+        rxChar = await service.getCharacteristic(RX_CHAR_UUID);
+        txChar = await service.getCharacteristic(TX_CHAR_UUID);
+
+        // Subscribe to incoming BLE notifications from Linux PC
+        await txChar.startNotifications();
+        txChar.addEventListener('characteristicvaluechanged', (event) => {
+          const decoder = new TextDecoder('utf-8');
+          const val = decoder.decode(event.target.value);
+          appendMessage(val, "msg-in");
+        });
+
+        document.getElementById('radio-status').textContent = "CONNECTED (BLE RADIO)";
+        document.getElementById('radio-status').className = "badge";
+        document.getElementById('msg-input').disabled = false;
+        document.getElementById('btn-send').disabled = false;
+        document.getElementById('btn-sos').disabled = false;
+
+        appendMessage("✅ Connected over BLE Radio! You can now send messages or SOS completely offline.", "msg-in");
+      } catch (err) {
+        appendMessage(`❌ Connection Error: ${err.message}`, "msg-in");
+      }
+    }
+
+    async function sendMessage() {
+      const input = document.getElementById('msg-input');
+      const text = input.value.trim();
+      if (!text || !rxChar) return;
+
+      try {
+        const encoder = new TextEncoder();
+        await rxChar.writeValue(encoder.encode(text));
+        appendMessage(`Me: ${text}`, "msg-out");
+        input.value = "";
+      } catch (err) {
+        appendMessage(`❌ Send Error: ${err.message}`, "msg-in");
+      }
+    }
+
+    async function sendSOS() {
+      if (!rxChar) return;
+      try {
+        const sosText = "🚨 SOS EMERGENCY ALERT! Immediate assistance required!";
+        const encoder = new TextEncoder();
+        await rxChar.writeValue(encoder.encode(sosText));
+        appendMessage("🚨 SOS EMERGENCY SENT OVER RADIO!", "msg-sos");
+      } catch (err) {
+        appendMessage(`❌ SOS Error: ${err.message}`, "msg-in");
+      }
+    }
+
+    function handleKey(e) {
+      if (e.key === 'Enter') sendMessage();
+    }
+  </script>
+</body>
+</html>

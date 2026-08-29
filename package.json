@@ -1,0 +1,25 @@
+{
+  "name": "reunite-mesh-app",
+  "version": "1.0.0",
+  "description": "Local-first offline P2P mesh network app architecture for disaster response and search & rescue",
+  "main": "src/contracts/mesh.ts",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "p2p",
+    "ble",
+    "mesh-network",
+    "local-first",
+    "offline-first",
+    "disaster-response"
+  ],
+  "author": "ReUnite Team",
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.3.3",
+    "vitest": "^1.2.0"
+  }
+}
