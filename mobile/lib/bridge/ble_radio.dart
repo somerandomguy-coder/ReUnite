@@ -15,8 +15,10 @@ class BleRadio {
   static const _method = MethodChannel('reunite/ble');
   static const _events = EventChannel('reunite/ble/events');
 
-  /// Bluetooth is only wired up on the two platforms that have a native implementation.
-  static bool get isAvailable => Platform.isAndroid || Platform.isIOS;
+  /// Bluetooth is only wired up on the platforms that have a native implementation.
+  /// macOS is central-role only: it can connect out to a peer that's advertising, but
+  /// (unlike Android/iOS) cannot advertise itself - see BleMeshCentral.swift.
+  static bool get isAvailable => Platform.isAndroid || Platform.isIOS || Platform.isMacOS;
 
   Future<bool> isSupported() async {
     if (!isAvailable) return false;
@@ -39,7 +41,7 @@ class BleRadio {
 
   /// Start advertising and scanning. Returns an error string, or null on success.
   Future<String?> start() async {
-    if (!isAvailable) return 'Bluetooth mesh is only available on Android and iOS';
+    if (!isAvailable) return 'Bluetooth mesh is only available on Android, iOS and macOS';
     try {
       await _method.invokeMethod<bool>('start');
       return null;

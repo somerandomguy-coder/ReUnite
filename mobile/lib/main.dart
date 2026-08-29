@@ -8,11 +8,12 @@ import 'services/mesh_service.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  // Bluetooth peripheral mode only exists on Android/iOS (see
-  // MeshService._requestBluetoothPermissions); desktop platforms use the Wi-Fi/UDP
+  // Android/iOS advertise and scan; macOS scans only (see BleMeshCentral.swift) but can
+  // still reach a phone with no network. Other desktop platforms use the Wi-Fi/UDP
   // transport, same as the CLI.
-  final transport =
-      (Platform.isAndroid || Platform.isIOS) ? MeshTransport.bluetooth : MeshTransport.wifi;
+  final transport = (Platform.isAndroid || Platform.isIOS || Platform.isMacOS)
+      ? MeshTransport.bluetooth
+      : MeshTransport.wifi;
   runApp(
     ChangeNotifierProvider(
       create: (_) => MeshService()..init(transport: transport),

@@ -201,9 +201,13 @@ class MeshService extends ChangeNotifier {
   /// Android 12+ gates scanning, advertising and connecting behind separate runtime
   /// permissions, and refuses silently without them.
   Future<String?> _requestBluetoothPermissions() async {
-    if (!Platform.isAndroid && !Platform.isIOS) {
-      return 'Bluetooth mesh is only available on Android and iOS';
+    if (!Platform.isAndroid && !Platform.isIOS && !Platform.isMacOS) {
+      return 'Bluetooth mesh is only available on Android, iOS and macOS';
     }
+    // macOS asks for Bluetooth authorization itself, via CoreBluetooth, the first time
+    // it scans - gated by NSBluetoothAlwaysUsageDescription in Info.plist. permission_handler
+    // has no macOS implementation to call here.
+    if (Platform.isMacOS) return null;
     try {
       final wanted = Platform.isAndroid
           ? [Permission.bluetoothScan, Permission.bluetoothAdvertise, Permission.bluetoothConnect]
