@@ -1,96 +1,94 @@
-# Project Plan: Offline P2P Emergency Mesh Network
+# Project Plan: Offline P2P Emergency Mesh Network (Production-Ready)
 
 ## 1. Executive Summary
-This document outlines the development plan for an offline peer-to-peer (P2P) emergency communication application. The app enables users to communicate and share GPS locations in environments without cellular or Wi-Fi infrastructure (e.g., natural disasters). It will initially be developed as a cross-platform command-line interface (CLI) for laptops, with a clear architectural path toward a mobile application (iOS/Android).
+This document outlines the development plan for a production-ready, offline peer-to-peer (P2P) emergency communication application. The app enables users to communicate, share GPS locations, broadcast SOS signals, and map safe zones in environments without cellular or Wi-Fi infrastructure (e.g., natural disasters). 
+
+The system will be designed for extreme battery efficiency and cross-platform compatibility. It features **zero-config onboarding** (no accounts, no internet required to start meshing) and is initially developed as a command-line interface (CLI) for laptops. It will scale to a mobile application (iOS/Android) and maintain a lightweight architecture capable of being ported to embedded systems (e.g., autonomous search-and-rescue drones).
 
 ## 2. Technology Stack & Rationale
 
-To achieve the goals of high performance, low-level hardware access (Bluetooth Low Energy/Wi-Fi Direct), cross-platform compatibility (Desktop + Mobile), and strong security, we recommend a **Core-and-Shell architecture**.
+To achieve high performance, low-level hardware access, multi-platform compatibility, and strict battery efficiency, we recommend a **Core-and-Shell architecture**. 
 
 ### Recommended Stack:
 *   **Core Logic & Networking:** **Rust**
-    *   *Why:* Rust offers memory safety, excellent performance, and compiles natively to all target platforms (macOS, Windows, Linux, iOS, Android). It is the best choice for building the complex, stateful mesh routing and cryptographic core.
-    *   *Libraries:* `btleplug` (for cross-platform BLE), `RustCrypto` or `ring` (for encryption/hashing), `tokio` (for asynchronous runtime).
+    *   *Why:* Rust offers memory safety, excellent performance, and zero-cost abstractions.
+    *   *Libraries:* `RustCrypto` (for encryption/hashing) and `heapless` for embedded-safe data structures.
 *   **CLI Application (Phase 1):** **Rust (with `clap` framework)**
-    *   *Why:* Keeps the Phase 1 implementation in a single language. `clap` provides a robust, easy-to-use parser for the complex terminal commands required.
-*   **Mobile / Desktop GUI (Phase 2):** **Flutter** or **React Native**
-    *   *Why:* Allows for a single codebase for the UI on Android, iOS, Windows, macOS, and Linux.
-    *   *Integration:* Use tools like `flutter_rust_bridge` (for Flutter) or `uniffi` to seamlessly connect the mobile UI to the Rust core.
-*   **Data Storage:** **SQLite** (via `rusqlite`) or a lightweight key-value store like `sled`.
-    *   *Why:* For persisting encrypted messages locally when `--enable-storing` is activated, and for storing address books (ID to Name mappings).
+*   **Mobile / Desktop GUI (Phase 2):** **Flutter** or **React Native** (using `flutter_rust_bridge` or `uniffi`).
+*   **Data Storage:** **SQLite** (via `rusqlite`).
 
-### Important Considerations for Mobile:
-*   **MAC Address Randomization:** Modern operating systems (iOS, Android, Windows) randomize MAC addresses for privacy and restrict direct access to the hardware MAC. Relying strictly on the hardware MAC address is unreliable. *Recommendation:* Generate a persistent random UUID on first launch, hash it, and use this as the Node ID.
-*   **Hardware APIs:** While BLE is universally supported, high-bandwidth P2P differs by OS (Apple uses Multipeer Connectivity; Android uses Wi-Fi Direct/Aware). The Rust core will need platform-specific adapters to utilize Wi-Fi for larger data transfers, falling back to BLE for discovery and small text/GPS packets.
+### Important Technical Considerations:
+*   **Strict `no_std` Core vs. `std` Shell Architecture:** To support embedded drone deployments, the application uses a strict split:
+    *   **The Core (`meshcore` - `#![no_std]`):** Completely OS-agnostic. Handles packet parsing, mesh algorithms, data structures, and cryptography. Compiles directly onto bare-metal microcontrollers (e.g., ESP32, nRF52).
+    *   **The Shell (`meshcli` / Mobile UI - `std`):** The wrapper interacting with the OS. Handles hardware Bluetooth/Wi-Fi APIs, async runtimes (`tokio`), file storage, and the UI.
+*   **Connectionless BLE (Advertising) vs. Paired Connections:** Establishing paired BLE connections between dozens of phones is flaky. **Strict requirement:** 90% of data (Routing pings, SOS, Heat Map, GPS) MUST be embedded directly into BLE Advertising Packets (Manufacturer Specific Data). Formal connections are ONLY established for the 3 seconds required to exchange a private network cryptographic key.
+*   **Zero-Config Onboarding:** The app must generate a random UUID on launch, hash it, grant permissions, and instantly join the default mesh without any user sign-up or verification.
 
 ---
 
 ## 3. Architecture & Data Flow
 
 ### 3.1 Network Topology (Mesh)
-The system will operate as a decentralized mesh network.
-*   **Nodes:** Every device is a node that acts as both a client and a router.
-*   **Discovery:** Nodes continuously broadcast a BLE beacon containing their Hashed ID.
-*   **Routing:** To find the most efficient route, nodes will track the Received Signal Strength Indicator (RSSI) of neighbors (to approximate distance) and measure message traversal latency.
+*   **Nodes:** Every device (phone, laptop, drone) is a node acting as both client and router.
+*   **Discovery & Telemetry:** Nodes continuously broadcast optimized BLE beacons containing their Hashed ID, SOS flag, and **Battery Level**.
+*   **Routing:** Store-and-forward routing based on RSSI and traversal latency.
 
-### 3.2 Security & Privacy
-*   **Identities:** ID is a cryptographic hash (e.g., SHA-256) of a locally generated UUID.
-*   **Encryption:** The `[default]` network is unencrypted (or uses a known shared key) for public broadcasts. Private networks use asymmetric encryption (e.g., X25519 for key exchange) to securely share a symmetric key (e.g., ChaCha20-Poly1305) for that specific network. Only members with the private network key can decrypt messages.
-
----
-
-## 4. Development Phases
-
-### Phase 1: Terminal MVP (Laptop)
-*Goal: Prove the P2P concept and mesh routing via a laptop terminal interface.*
-
-**Step 1.1: Core Node Initialization & Discovery**
-*   Implement BLE advertising and scanning.
-*   Generate the Hashed ID.
-*   Implement the `[default]` network state. Devices can see each other and exchange basic ping/GPS packets.
-
-**Step 1.2: The CLI Interface & Local State**
-*   Implement the command parser.
-*   Implement `--rename [ID] [name]`: Store this mapping in a local SQLite database or JSON file.
-
-**Step 1.3: Private Networks & Cryptography**
-*   Implement `--create-network [name]`: Generates a new cryptographic keypair for the network.
-*   Implement `--network [name] --add [user]`: The host encrypts the network's shared symmetric key using the invited user's public key (retrieved via the default network) and sends it to them.
-*   Implement `--network [name] --enable-storing`: Write incoming/outgoing messages for this network to the local database.
-
-**Step 1.4: Decentralized Moderation (Voting)**
-*   Implement the kick voting mechanism. When a user issues a kick request, it broadcasts a signed vote to the network. Nodes tally the votes. If `votes >= (network_size / 2)`, the network generates a new shared key, distributes it to all remaining users, effectively locking out the kicked user.
-
-**Step 1.5: Mesh Routing Logic**
-*   Implement the store-and-forward mechanism. If User A wants to reach User C, but is only connected to User B, User B relays the encrypted packet.
-*   Implement the routing table based on RSSI and latency.
-
-### Phase 2: Mobile Application (Future)
-*Goal: Bring the mesh network to smartphones with a user-friendly UI.*
-
-*   **Extract Core:** Ensure the Rust core is fully decoupled from the CLI interface.
-*   **Bridge:** Setup `flutter_rust_bridge` (if using Flutter).
-*   **UI Implementation:** Build screens for Map (GPS view), Chats, Network Management, and Settings.
-*   **Platform Specifics:** Implement background processing permissions (CoreBluetooth on iOS, Bluetooth/Location permissions on Android).
+### 3.2 Key Features & Strict Data Packets
+*   **In-Network SOS Signal:** An opt-in, high-priority packet that flips an SOS bit in the BLE beacon. Explicitly isolated from the OS hardware SOS to prevent false emergency service alarms outside the local mesh.
+*   **Safe Zone Heat Map (H3 Hex Grids & Consensus):** To prevent broadcast storms, heat map data CANNOT be raw coordinates. **Strict requirement:** The app must aggregate data into low-resolution H3 hex grids. Nodes broadcast a single byte representing the safety average of their hex grid. The UI must display a **"Trust Consensus"** count (how many users verified the zone) before rendering the Red/Green gradient.
+*   **"Last Known Location" Ghosting:** If a node drops off the network (e.g., battery dies), they do not disappear from the map. The UI must cache their last known GPS ping and timestamp, rendering them as a grayed-out "ghost" dot (e.g., *"Last seen here 45 mins ago"*).
+*   **Pre-Canned Panic Messages:** To save BLE bandwidth and aid panicked users, the UI must provide large buttons for common updates ("I am safe", "Need Medical"). Under the hood, the Rust core must pack these as single-byte binary codes, NOT raw strings.
+*   **Identities & Encryption:** Public Networks use unencrypted broadcasts. Private Networks use X25519 asymmetric encryption to securely exchange a ChaCha20-Poly1305 symmetric key.
 
 ---
 
-## 5. System Commands Reference (CLI)
+## 4. Development Phases (Step-by-Step)
 
-Upon launching the application, the prompt will display the current active network, e.g., `[default] >`.
+### Phase 1: Terminal MVP (Laptop) - Core Concept Proof
+*Goal: Build the production-ready Rust core and prove connectionless mesh routing.*
+
+*   **Step 1.1: Core Node & Discovery:** Implement connectionless BLE advertising/scanning, Hashed ID generation, and Battery Level telemetry.
+*   **Step 1.2: Mesh Routing & CLI:** Implement store-and-forward routing (with TTL) and the basic `clap` CLI. Include binary-packing for Pre-Canned Messages.
+*   **Step 1.3: Private Networks:** Implement X25519 key exchange and decentralized kick-voting.
+*   **Step 1.4: In-Network SOS & Last Known Location:** Implement `--sos` and local caching of node timestamps.
+*   **Step 1.5: Aggregated Heat Map:** Implement H3 hex-grid aggregation and consensus counting for `--report-zone`.
+
+### Phase 2: Mobile Application (iOS/Android)
+*Goal: Bring the mesh network to smartphones with a battery-efficient, user-friendly UI.*
+
+*   **Step 2.1: Mobile BLE & Bridge Integration:** Because Rust BLE libraries struggle with mobile OS lifecycles, the BLE transport layer for mobile will be written using **native plugins (Swift/CoreBluetooth, Kotlin/Android BLE)**. The UI passes raw BLE packets through `flutter_rust_bridge` to the `no_std` core.
+*   **Step 2.2: Map & Heat Map UI:** Implement an offline map view. **Strict requirement:** If offline map tiles are not downloaded, the UI must gracefully degrade to a "Compass/Grid Mode" showing relative distance and direction to peers.
+*   **Step 2.3: SOS & Panic UI:** Implement a protected slide-to-activate SOS button and 1-tap Pre-Canned Panic Messages.
+*   **Step 2.4: Chat & Network UI:** Build screens for private messaging, network management, and zero-config onboarding.
+*   **Step 2.5: Background Optimization:** Leverage native mobile BLE layers for iOS CoreBluetooth background modes and Android foreground services.
+
+### Phase 3: Embedded Integration (Drones & IoT)
+*Goal: Port the core to autonomous systems for enhanced rescue operations.*
+
+*   **Step 3.1: `no_std` Porting:** Ensure the core compiles entirely in `#![no_std]`.
+*   **Step 3.2: Drone Node Deployment:** Flash the core onto ESP32/nRF52 radios on drones.
+*   **Step 3.3: Aerial Relays & Search:** Drones act as sky-relays, expanding network range and triangulating SOS signals.
+
+---
+
+## 5. System Commands Reference (CLI Phase 1)
 
 | Command | Description |
 | :--- | :--- |
-| `--create-network [name]` | Creates a new private network and switches context to it (e.g., `[name] >`). Generates network encryption keys. |
-| `--network [name] --add [user_id]` | Invites a user (by their Hashed ID) to the specified private network. Securely exchanges keys. |
+| `--create-network [name]` | Creates a private network and generates encryption keys. |
+| `--network [name] --add [user_id]`| Invites a user securely via public key exchange. |
+| `--kick [user_id]` | Initiates a decentralized vote to kick a user (requires >=50% consensus). |
+| `--rename [id] [name]` | Creates a local alias for a user ID. |
+| `--broadcast [msg]` | Sends a custom string message to the network. |
+| `--status [code]` | Sends a pre-canned 1-byte binary message (e.g., `1` = Safe, `2` = Medical). |
+| `--sos start` / `stop` | Toggles the high-priority In-Network SOS broadcast. |
+| `--report-zone [lat] [lon] [lvl]` | Submits a safety report, automatically mapped to an H3 hex grid. |
+| `--heatmap show` | Dumps the current aggregated hex grid safety zones and consensus counts. |
 | `--network [name] --enable-storing`| Toggles local disk storage for messages in the specified network. |
-| `--kick [user_id]` | Initiates or adds a vote to kick a user from the current private network. (Requires >=50% consensus). |
-| `--rename [id] [name]` | Creates a local alias for a user ID. The UI/CLI will display `[name]` instead of the hash. |
-| `--switch [network_name]` | Switches the active CLI context to a different network. |
-| `--broadcast [message]` | Sends a message to all users in the current network context. |
 
 ## 6. Known Challenges to Address
-1.  **Background Execution:** Mobile OSes aggressively kill background apps to save battery. The BLE beaconing must be carefully designed to operate within OS constraints (e.g., iOS CoreBluetooth background modes).
-2.  **Mesh Network Flooding:** In dense areas, broadcast storms can occur. The routing algorithm must include Time-To-Live (TTL) and packet deduplication to prevent network collapse.
-3.  **App Distribution:** In a disaster scenario without internet, how do users download the app? Consider implementing a feature where the app can share its own installer (APK on Android) via a captive portal over Wi-Fi Direct.
-4.  **MAC Address Privacy:** User proposal requested hashing the MAC address. As noted in section 2, OS level restrictions make static MAC address retrieval difficult. Using an App-generated UUID on first install is functionally identical and more robust.
+
+1.  **The BLE Bandwidth Compromise (No Pictures):** BLE has microscopic payload sizes. We must explicitly ban sending images or voice notes. The app must be ruthlessly restricted to binary-packed data.
+2.  **Heat Map Data Scaling:** Addressed by enforcing H3 grid aggregation. Raw coordinates for safety zones would crash the network.
+3.  **Background Execution Limits:** Mobile OSes aggressively kill background apps. Strict native integration is required.
+4.  **App Distribution (Offline):** Must implement a captive portal over Wi-Fi Direct so users can share the Android APK directly to victims who do not have the app installed.
