@@ -157,3 +157,81 @@ async fn a_device_that_disconnects_loses_its_link_address() {
     ext.send_to(b"reply", addr).await.unwrap();
     assert_eq!(ext.take_outbound().unwrap().to, None);
 }
+
+/// Phase 2D: a node running every radio it has, rather than being asked to pick one.
+///
+/// The point of `MultiTransport` is that the answer to "which radio?" is always "all of
+/// them", and that one dead radio must never take the node down with it. Both halves are
+/// checked here, because the second is what makes the first safe to ship.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_meshes_over_whichever_of_its_radios_is_working() {
+    use meshcore::transport::MultiTransport;
+
+    // Alice has two radios. Only the second one is connected to anything - the first is
+    // the phone with Bluetooth switched off, or the laptop with no peripheral role.
+    let dead = Arc::new(ExternalTransport::new("ble/dead"));
+    let live_a = Arc::new(ExternalTransport::new("udp/live-a"));
+    let live_b = Arc::new(ExternalTransport::new("udp/live-b"));
+
+    let multi = Arc::new(
+        MultiTransport::new(vec![
+            dead.clone() as Arc<dyn Transport>,
+            live_a.clone() as Arc<dyn Transport>,
+        ])
+        .unwrap(),
+    );
+    assert_eq!(multi.len(), 2);
+    assert!(
+        multi.describe().contains("ble/dead") && multi.describe().contains("udp/live-a"),
+        "the status panel needs every radio named, not a single summary: {}",
+        multi.describe(),
+    );
+
+    let mut cfg_a = NodeConfig::new(temp_home("multi-a"));
+    cfg_a.self_name = Some("alice".into());
+    cfg_a.hello_interval = Duration::from_millis(300);
+
+    let mut cfg_b = NodeConfig::new(temp_home("multi-b"));
+    cfg_b.self_name = Some("bob".into());
+    cfg_b.hello_interval = Duration::from_millis(300);
+
+    let (a, mut events_a) = Node::spawn(cfg_a, multi.clone() as Arc<dyn Transport>).unwrap();
+    let (_b, mut events_b) = Node::spawn(cfg_b, live_b.clone() as Arc<dyn Transport>).unwrap();
+    let pumper = pump(live_a.clone(), live_b.clone());
+
+    // Discovery works even though half of alice's radios reach nobody. A node that gave
+    // up because one radio was silent would be a phone that refuses to mesh because
+    // Bluetooth is off.
+    wait_for(&mut events_a, |e| matches!(e, Event::PeerJoined { .. })).await;
+    wait_for(&mut events_b, |e| matches!(e, Event::PeerJoined { .. })).await;
+
+    // Traffic crosses, and a routed reply goes back out the radio it arrived on rather
+    // than being shouted over every radio the node owns.
+    a.call(Command::Broadcast("both radios up".into()))
+        .await
+        .unwrap();
+    let chat = wait_for(&mut events_b, |e| matches!(e, Event::Chat { .. })).await;
+    match chat {
+        Event::Chat { text, .. } => assert_eq!(text, "both radios up"),
+        _ => unreachable!(),
+    }
+
+    // The dead radio was still offered every broadcast - it is queued, not skipped, so a
+    // radio that comes back mid-session starts carrying traffic without a restart.
+    assert!(
+        dead.pending() > 0,
+        "a silent radio must still be handed frames, or reconnecting would need a restart",
+    );
+
+    pumper.abort();
+}
+
+#[tokio::test]
+async fn a_node_with_no_radio_at_all_is_a_configuration_error() {
+    use meshcore::transport::MultiTransport;
+
+    // Every other failure in this file degrades. This one cannot: there is nothing left
+    // to degrade to, and silently starting a node that can never send is worse than
+    // refusing.
+    assert!(MultiTransport::new(vec![]).is_err());
+}

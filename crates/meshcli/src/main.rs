@@ -66,8 +66,11 @@ struct Args {
     #[arg(long, requires = "lat")]
     lon: Option<f64>,
 
-    /// Transport layer to use: udp (Wi-Fi/LAN) or ble (Bluetooth Low Energy).
-    #[arg(long, default_value = "udp")]
+    /// Radios to use: `all` (default), `udp` (Wi-Fi/LAN) or `ble` (Bluetooth, Linux only).
+    ///
+    /// `all` starts every radio this machine has and meshes over all of them at once. A
+    /// radio that will not start costs that radio, not the node.
+    #[arg(long, default_value = "all")]
     transport: String,
 
     /// Only hear these node ids (simulated radio range, for testing multi-hop routing).
@@ -92,38 +95,74 @@ async fn main() -> Result<()> {
     let home = resolve_home(args.home.clone())?;
     use meshcore::transport::Transport;
 
-    let (transport, transport_description): (Arc<dyn Transport>, String) = match args.transport.to_lowercase().as_str() {
-        "ble" => {
-            #[cfg(target_os = "linux")]
-            {
-                let ble = meshcore::transport::BleLinuxTransport::bind(args.name.clone()).await?;
-                let desc = ble.describe();
-                (Arc::new(ble), desc)
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                bail!("Native Rust BLE transport is available directly on Linux via BlueZ. On macOS, run `python3 scripts/ble_gateway.py` to bridge BLE radio traffic to meshnet UDP!");
+    // Phase 2D: every radio at once. A radio that cannot start is reported and skipped -
+    // a laptop with no Bluetooth still meshes over Wi-Fi, which is the whole point of
+    // not making this a choice.
+    let want = args.transport.to_lowercase();
+    let (want_ble, want_udp) = match want.as_str() {
+        "ble" => (true, false),
+        "udp" => (false, true),
+        _ => (true, true),
+    };
+
+    let mut radios: Vec<Arc<dyn Transport>> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+
+    if want_ble {
+        #[cfg(target_os = "linux")]
+        {
+            match meshcore::transport::BleLinuxTransport::bind(args.name.clone()).await {
+                Ok(ble) => radios.push(Arc::new(ble)),
+                Err(e) => skipped.push(format!("bluetooth: {e}")),
             }
         }
-        _ => {
-            let seeds = resolve_seeds(&args.peers)?;
-            let udp = UdpTransport::bind(UdpConfig {
-                port: args.port,
-                group: args.group,
-                multicast: !args.no_multicast,
-                broadcast: !args.no_broadcast,
-                seeds,
-            })
-            .with_context(|| {
-                format!(
-                    "could not bind UDP port {} - is another node already using it? try --port {}",
-                    args.port,
-                    args.port + 1
-                )
-            })?;
-            let desc = udp.describe();
-            (Arc::new(udp), desc)
+        #[cfg(not(target_os = "linux"))]
+        {
+            // Not a failure, a platform limit (deviation D3): macOS and Windows cannot
+            // advertise as a BLE peripheral from userspace, so a laptop there reaches
+            // Bluetooth peers through `scripts/ble_gateway.py` instead.
+            skipped.push(
+                "bluetooth: this OS cannot advertise as a BLE peripheral - \
+                 run scripts/ble_gateway.py to bridge one"
+                    .to_string(),
+            );
         }
+    }
+
+    if want_udp {
+        let seeds = resolve_seeds(&args.peers)?;
+        match UdpTransport::bind(UdpConfig {
+            port: args.port,
+            group: args.group,
+            multicast: !args.no_multicast,
+            broadcast: !args.no_broadcast,
+            seeds,
+        }) {
+            Ok(udp) => radios.push(Arc::new(udp)),
+            Err(e) => skipped.push(format!(
+                "wi-fi: {e} - is another node on port {}? try --port {}",
+                args.port,
+                args.port + 1
+            )),
+        }
+    }
+
+    if radios.is_empty() {
+        bail!(
+            "no radio could be started:\n  {}",
+            skipped.join("\n  ")
+        );
+    }
+
+    let transport_description = radios
+        .iter()
+        .map(|r| r.describe())
+        .collect::<Vec<_>>()
+        .join(" + ");
+    let transport: Arc<dyn Transport> = if radios.len() == 1 {
+        radios.remove(0)
+    } else {
+        Arc::new(meshcore::transport::MultiTransport::new(radios)?)
     };
 
     let mut config = NodeConfig::new(home.clone());
@@ -152,7 +191,10 @@ async fn main() -> Result<()> {
         style.bold("offline mesh node started - you are in [default]")
     );
     println!("  node id  : {}", style.cyan(&handle.id.to_hex()));
-    println!("  transport: {transport_description}");
+    println!("  radios   : {transport_description}");
+    for note in &skipped {
+        println!("  {}", style.dim(&format!("not used - {note}")));
+    }
     println!("  home     : {}", home.display());
     println!(
         "  {}",
@@ -374,15 +416,25 @@ fn parse_command(cmd: &str, rest: &[String]) -> Result<Command> {
             Ok(Command::SetStatus { code })
         }
         "--report-zone" => {
-            if rest.len() < 3 {
-                bail!("usage: --report-zone [lat] [lon] [level 0-4]");
+            if rest.len() < 4 {
+                bail!("usage: --report-zone [lat] [lon] safe|unsafe [radius] [unit m|km|ft|mi]");
             }
             let lat: f64 = rest[0].parse().map_err(|_| anyhow!("bad latitude"))?;
             let lon: f64 = rest[1].parse().map_err(|_| anyhow!("bad longitude"))?;
-            let level: u8 = rest[2]
+            let verdict = meshcore::zones::parse_verdict(&rest[2])
+                .ok_or_else(|| anyhow!("say 'safe' or 'unsafe', not '{}'", rest[2]))?;
+            let length: f64 = rest[3]
                 .parse()
-                .map_err(|_| anyhow!("bad level - use 0 (dangerous) to 4 (safe)"))?;
-            Ok(Command::ReportZone { lat, lon, level })
+                .map_err(|_| anyhow!("bad radius - a number, then a unit"))?;
+            // Metres by default, so the common case is one word shorter to type.
+            let unit = rest.get(4).map(String::as_str).unwrap_or("m");
+            let radius_m = meshcore::zones::to_metres(length, unit)?;
+            Ok(Command::ReportZone {
+                lat,
+                lon,
+                verdict,
+                radius_m,
+            })
         }
         "--heatmap" => match rest.first().map(String::as_str) {
             None | Some("show") => Ok(Command::Heatmap),

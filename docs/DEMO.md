@@ -327,34 +327,48 @@ sorted nearest first (GPS distance, then hops, then latency); ghosts last
 Ghosts sort below every reachable peer, keep their last GPS fix, and carry the age of that
 fix. Where someone was last seen is exactly what a search needs.
 
-## 11. The safe-zone heat map
+## 11. Safe and unsafe zones
 
 Raw coordinates would flood the network, so a report is snapped to an H3 hex cell
-(resolution 8, about a town block) and only the cell travels. On **B**:
+(resolution 8, about a town block) and only the cell travels — carrying the verdict and
+the radius the reporter chose. On **B**:
 
 ```
-[default] > --report-zone 10.7769 106.7009 4
-[default] reported cell 8865b5662bfffff at level 4/4 - now 4.0/4 with 1 verifying
+[default] > --report-zone 10.7769 106.7009 unsafe 750 m
+[default] reported unsafe within 750 m of cell 8865b5662bfffff - now reads unsafe (0 safe / 1 unsafe)
 ```
 
-On **C**, a few metres away — the same cell, a gloomier opinion:
+The unit is optional and defaults to metres; `km`, `ft` and `mi` all work, so
+`--report-zone 10.7769 106.7009 safe 0.5 km` and `... safe 1640 ft` are the same claim.
+
+On **C**, a few metres away — the same cell, a different opinion:
 
 ```
-[default] > --report-zone 10.77695 106.70095 2
+[default] > --report-zone 10.77695 106.70095 safe 300 m
 ```
 
 On **A**:
 
 ```
-# zone 8865b5662bfffff is now 3.0/4 safe, 2 verifying (via ~bob)
+# zone 8865b5662bfffff now reads unsafe within 750 m (1 safe / 1 unsafe, via ~carol)
 
 [default] > --heatmap show
-CELL               LAT          LON          SAFETY     CONSENSUS  AGE    MINE
-8865b5662bfffff    10.77508     106.69941    3.0/4      2          2s
-safety 0 = dangerous, 4 = safe. consensus = how many distinct nodes reported it.
+CELL               LAT          LON          VERDICT   RADIUS    SAFE    UNSAFE  AGE    MINE
+8865b5662bfffff    10.77508     106.69941    unsafe    750 m     1       1       2s
+a cell is safe only when more people vouch for it than against it - a tie reads unsafe.
+radius is the mean of the reports that agree with the verdict.
 ```
 
-Two things to notice.
+Three things to notice.
+
+**A tie reads unsafe.** One person says safe, one says unsafe, and the cell renders red.
+There is no amber, and no averaging into "moderate" — a contested area is not a safe area,
+and the false alarm is the cheaper mistake. Have a third node report `safe` and the cell
+flips to safe with `2 safe / 1 unsafe`; the dissent stays on screen either way.
+
+**The radius is the mean of the reports that agree with the verdict.** While the cell reads
+unsafe it shows B's 750 m, not the average of 750 and 300 — C was describing a different
+claim about the same ground.
 
 **Consensus counts people, not reports.** Have C report the same cell again and the count
 stays at 2 — a node re-reporting replaces its own earlier opinion and can never manufacture

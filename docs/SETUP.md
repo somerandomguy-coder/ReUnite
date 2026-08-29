@@ -172,11 +172,17 @@ You land in the public `[default]` network straight away:
 ```
 offline mesh node started - you are in [default]
   node id  : b809ed72839ec44b
-  transport: udp/0.0.0.0:47474, multicast 239.42.13.7:47474, broadcast
+  radios   : udp/0.0.0.0:47474, multicast 239.42.13.7:47474, broadcast
+  not used - bluetooth: this OS cannot advertise as a BLE peripheral - run scripts/ble_gateway.py to bridge one
   home     : /Users/alice/.meshnet
   type --help for commands, or just type a message to broadcast
 [default] >
 ```
+
+**`meshnet` starts every radio the machine has**, and meshes over all of them at once.
+A radio that cannot start is named with the reason and skipped — it costs that radio, not
+the node. On Linux that line lists Bluetooth alongside Wi-Fi; on macOS and Windows it does
+not, because neither can advertise as a BLE peripheral from userspace (deviation D3).
 
 Useful flags:
 
@@ -187,6 +193,30 @@ Useful flags:
 | `--port 47475` | Another program owns 47474, or you are running a second node on one machine |
 | `--peer 192.168.1.42:47474` | Multicast is blocked — see step 7 |
 | `--home ./nodeA` | Keep this node's identity and messages in a specific folder |
+| `--transport udp` / `--transport ble` | Pin one radio instead of using all of them. For testing; the default is `all` |
+
+### Joining on boot
+
+So that "switched on" really is the whole onboarding:
+
+```bash
+./scripts/autostart/install.sh            # launchd (macOS) or systemd --user (Linux)
+./scripts/autostart/install.sh --remove   # undo
+```
+
+It runs `meshnet` with no arguments — already zero-config — and restarts it if it dies.
+Logs go to `~/.meshnet/meshnet.log` on macOS, and `journalctl --user -u meshnet -f` on
+Linux. To keep meshing while logged out on Linux: `sudo loginctl enable-linger $USER`.
+
+On Windows, put a shortcut to `target\release\meshnet.exe` in
+`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`.
+
+### The node goes quiet when it is alone
+
+After about a minute with no peers the beacon slows from every 3 seconds to every 10, then
+30, then 60 — and the log says so once per change. It snaps back to 3 seconds the moment
+anything is heard, and never backs off while an SOS is active. This is deliberate; see
+[ARCHITECTURE.md](ARCHITECTURE.md#the-duty-cycle).
 
 ## 6. Verify the mesh
 

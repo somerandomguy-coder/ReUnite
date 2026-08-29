@@ -11,7 +11,109 @@ import '../bridge/ble_radio.dart';
 import '../bridge/mesh_ffi.dart';
 import '../models/mesh_models.dart';
 
-/// Which radio the mesh is running on.
+/// The message to show for a radio state the platform reported, or null when there is
+/// nothing to say.
+///
+/// A free function so it can be tested without a radio. The rule it encodes is the one
+/// that cost this project its entire iOS Bluetooth support: **only a state the platform
+/// actually reported may produce a diagnosis.** `unknown` and `resetting` are the
+/// platform declining to answer, and the app must decline too - the previous build
+/// turned "I do not know yet" into "Bluetooth is turned off", which sent people to check
+/// a setting that was already correct.
+String? bleErrorForRadioState(String state) => switch (state) {
+      'off' => 'Bluetooth is turned off - switch it on to reach other phones',
+      'unauthorized' => 'Bluetooth permission was refused - grant it in Settings',
+      'unsupported' => 'this device has no Bluetooth LE radio',
+      _ => null,
+    };
+
+/// Whether a platform may use the automatic UDP discovery paths - multicast and
+/// broadcast - or has to be told each address it is allowed to talk to.
+///
+/// iOS gets neither, and that is not a preference. Apple gates **both** UDP multicast and
+/// UDP broadcast, sending and receiving alike, behind
+/// `com.apple.developer.networking.multicast` - a restricted entitlement granted only on
+/// application to Apple, which this build does not hold. Frames on those paths are
+/// dropped by the OS before they reach the wire, and inbound ones are dropped on receipt.
+///
+/// Leaving the switches on would not make them work. It would only make the core's own
+/// `describe()` announce `broadcast` on a transport that has no such reach - a confident
+/// wrong answer, which this codebase treats as worse than no answer at all for exactly
+/// the reason spelled out above [bleErrorForRadioState]. What Apple does leave open is
+/// plain unicast, which needs only the local-network permission, so on iOS Wi-Fi reaches
+/// the addresses it was given and nothing else.
+bool udpAutoDiscoveryDefault({required bool isIOS}) => !isIOS;
+
+/// Split a peer list into `host:port` entries, dropping blanks and `#` comments.
+///
+/// One parser for both routes in: the `--dart-define=MESH_PEERS=a,b` build flag and the
+/// saved file, which is the same list one per line.
+List<String> parsePeerList(String raw) => raw
+    .split('\n')
+    // Comments are stripped per line, before the line is split - otherwise the words of
+    // a comment survive as peers, which is a silent way to feed the core garbage.
+    .map((line) {
+      final hash = line.indexOf('#');
+      return hash < 0 ? line : line.substring(0, hash);
+    })
+    .expand((line) => line.split(RegExp(r'[,\s]+')))
+    .map((p) => p.trim())
+    .where((p) => p.isNotEmpty)
+    .toList();
+
+/// Why [value] is not a usable `host:port` peer address, or null when it is.
+///
+/// Deliberately shallow - it checks the shape, never whether anything is listening.
+/// The core parses each address itself and silently drops one it cannot read, so
+/// catching the typo here is the difference between being told about it and no feedback
+/// at all.
+String? peerAddressError(String value) {
+  final text = value.trim();
+  if (text.isEmpty) return 'enter an address like 10.17.158.195:47474';
+  // Last colon, so an IPv6 literal in brackets still splits on its port.
+  final colon = text.lastIndexOf(':');
+  if (colon <= 0 || colon == text.length - 1) {
+    return 'needs a host and a port, like 10.17.158.195:47474';
+  }
+  final port = int.tryParse(text.substring(colon + 1));
+  if (port == null || port < 1 || port > 65535) {
+    return 'the part after ":" must be a port number, like 47474';
+  }
+  return null;
+}
+
+/// The JSON handed to `mesh_start`.
+///
+/// A free function so a test can assert on the exact configuration a platform produces
+/// without binding a socket or loading the core - which matters most for iOS, whose
+/// configuration cannot be exercised on the machine that builds it.
+Map<String, dynamic> startConfigJson({
+  required String home,
+  required MeshTransport transport,
+  required String name,
+  required int port,
+  required List<String> peers,
+  required bool multicast,
+  required bool broadcast,
+}) =>
+    {
+      'home': home,
+      'transport': switch (transport) {
+        MeshTransport.bluetooth => 'ble',
+        MeshTransport.wifi => 'udp',
+        MeshTransport.all => 'all',
+      },
+      'name': name,
+      'port': port,
+      'peers': peers,
+      'multicast': multicast,
+      'broadcast': broadcast,
+    };
+
+/// Which radios the mesh is using.
+///
+/// Phase 2D removed the choice: a device starts every radio it has. This enum survives
+/// only so the CLI and the tests can still pin one, and so the UI can say which are up.
 enum MeshTransport {
   /// UDP over Wi-Fi. Works laptop-to-laptop and phone-to-phone, but needs a shared
   /// network or hotspot.
@@ -19,6 +121,9 @@ enum MeshTransport {
 
   /// Bluetooth Low Energy via the native plugin. Needs no infrastructure at all.
   bluetooth,
+
+  /// Everything this device has. The default, and the only value the app passes.
+  all,
 }
 
 /// The app's single connection to the mesh.
@@ -42,6 +147,25 @@ class MeshService extends ChangeNotifier {
   MeshTransport _transport = MeshTransport.wifi;
   int _bleConnected = 0;
   String? _bleError;
+  String? _radioNotice;
+  String _radioState = 'unknown';
+  String _cadence = 'low_latency';
+
+  /// Where the core keeps its state. Cached from the first [init] so [addPeer] can write
+  /// beside it, and so a restart through [switchTransport] lands in the same directory
+  /// rather than jumping to the real app-support path a test was avoiding.
+  String? _homePath;
+  List<String> _seedPeers = const [];
+  bool _multicast = true;
+  bool _broadcast = true;
+
+  /// The unit the reporter last used. Kept here rather than in the widget so it survives
+  /// tab changes and rebuilds - nobody picks their unit twice in an emergency.
+  ///
+  /// Session-scoped, not persisted to disk: that would need a preferences store the app
+  /// does not carry yet, and the win from surviving a full restart is much smaller than
+  /// the win from surviving a tab switch.
+  RadiusUnit lastRadiusUnit = RadiusUnit.metres;
 
   bool _started = false;
   String? _startError;
@@ -57,10 +181,47 @@ class MeshService extends ChangeNotifier {
   MeshTransport get transport => _transport;
   bool get bluetoothAvailable => BleRadio.isAvailable;
 
+  /// The `host:port` addresses this node dials directly, in the order it will try them.
+  ///
+  /// On iOS this is the entire Wi-Fi reach of the node - see [udpAutoDiscoveryDefault] -
+  /// so an empty list there is a fact worth putting on screen. Everywhere else it is
+  /// extra reach on top of discovery, and empty is the normal state.
+  List<String> get seedPeers => List.unmodifiable(_seedPeers);
+
+  /// True when the node asked the UDP transport for the automatic discovery paths.
+  bool get udpAutoDiscovery => _multicast || _broadcast;
+
+  /// True when Wi-Fi is one of the radios currently carrying the mesh.
+  bool get usingWifi => _transport != MeshTransport.bluetooth;
+
+  /// True when Bluetooth is one of the radios currently carrying the mesh.
+  bool get usingBluetooth =>
+      (_transport == MeshTransport.bluetooth || _transport == MeshTransport.all) &&
+      _bleError == null;
+
+  /// The radios in use, in plain words, for anywhere that has to name them.
+  String get radioNames => switch (_transport) {
+        MeshTransport.bluetooth => 'Bluetooth',
+        MeshTransport.wifi => 'Wi-Fi',
+        MeshTransport.all => _bleError == null ? 'Bluetooth and Wi-Fi' : 'Wi-Fi',
+      };
+
   /// Peers the radio can actually reach right now. Zero on Bluetooth means nothing is
   /// connected yet, which is the single most useful thing to show while someone waits.
   int get bleConnected => _bleConnected;
   String? get bleError => _bleError;
+
+  /// The last state the platform reported for the radio: `on`, `off`, `unauthorized`,
+  /// `unsupported`, `resetting`, or `unknown` before it has said anything.
+  String get radioState => _radioState;
+
+  /// How hard the radio is currently listening: `low_latency`, `balanced` or
+  /// `low_power`. Shown so a quiet mesh does not look like a broken one.
+  String get cadence => _cadence;
+
+  /// Set when the mesh came up on a different radio than was asked for - a downgrade the
+  /// user is entitled to know about, but which is not an error and must not read as one.
+  String? get radioNotice => _radioNotice;
   Whoami? get me => _me;
   String get nodeId => _me?.id ?? '...';
   String get activeNetwork => _me?.network ?? 'default';
@@ -79,51 +240,85 @@ class MeshService extends ChangeNotifier {
 
   // ------------------------------------------------------------------ lifecycle
 
+  Timer? _autoGpsTimer;
+
   /// Zero-config onboarding (plan.md §2): generate an identity, join `[default]`, done.
   /// No account, no sign-up, and nothing here touches the internet.
   /// [homeOverride], [port], [multicast] and [broadcast] exist so tests can start a real
   /// node without colliding with a node already running on this machine.
-  Timer? _autoGpsTimer;
-
+  ///
+  /// [peers] are extra `host:port` addresses to dial directly, from the build's
+  /// `--dart-define=MESH_PEERS=...`. Anything saved on the device by [addPeer] is merged
+  /// in behind them. [multicast] and [broadcast] default per platform - see
+  /// [udpAutoDiscoveryDefault], which is why they are nullable rather than `true`.
   Future<void> init({
     List<String> peers = const [],
     String? homeOverride,
     int port = 47474,
     bool? multicast,
-    bool broadcast = true,
+    bool? broadcast,
     String? name,
-    MeshTransport transport = MeshTransport.bluetooth,
+    MeshTransport transport = MeshTransport.all,
   }) async {
     if (_started) return;
     _transport = transport;
     try {
-      if (transport == MeshTransport.bluetooth) {
+      // A missing core is the one failure that has to name itself. Every call would
+      // otherwise return an empty reply and the app would blame the mesh for a build step
+      // nobody ran.
+      if (_ffi.isStub) {
+        _startError = MeshFfi.loadError ?? 'the mesh core could not be loaded';
+        notifyListeners();
+        return;
+      }
+      // Every radio this device has, started together. Only platforms with a native
+      // Bluetooth layer get that one; the rest mesh over Wi-Fi alone and say so.
+      //
+      // Nothing here is fatal. A missing or refused radio costs that radio, never the
+      // node: a phone with Bluetooth off still meshes over Wi-Fi, a laptop with no
+      // peripheral role still meshes over UDP. Refusing to start turns "this device has
+      // one radio" into "The mesh core did not start", which reads as a broken build.
+      final wantBle =
+          transport != MeshTransport.wifi && BleRadio.isAvailable;
+      if (transport == MeshTransport.all && !BleRadio.isAvailable) {
+        _radioNotice = 'No Bluetooth mesh on this platform - running over Wi-Fi. '
+            'Other devices must be on the same Wi-Fi or hotspot.';
+      }
+      if (wantBle) {
+        // Asked for when the radio needs it, not up front: an app that demands Bluetooth
+        // before showing anything is an app people deny and then uninstall.
         final denied = await _requestBluetoothPermissions();
         if (denied != null) {
-          _startError = denied;
-          notifyListeners();
-          return;
+          // Degrade, do not stop. The mesh still has Wi-Fi, and the banner says why
+          // Bluetooth is missing.
+          _radioNotice = denied;
+          _bleError = denied;
         }
       }
-      final String homePath;
-      if (homeOverride != null) {
-        homePath = homeOverride;
-      } else {
-        final dir = await getApplicationSupportDirectory();
-        homePath = '${dir.path}/reunite';
-      }
-      final home = Directory(homePath);
-      if (!home.existsSync()) home.createSync(recursive: true);
+      _transport = wantBle && _bleError == null
+          ? (transport == MeshTransport.all ? MeshTransport.all : MeshTransport.bluetooth)
+          : MeshTransport.wifi;
+      final homePath = await _resolveHome(homeOverride);
 
-      final reply = _ffi.start({
-        'home': home.path,
-        'transport': transport == MeshTransport.bluetooth ? 'ble' : 'udp',
-        'name': name ?? _defaultName(),
-        'port': port,
-        'peers': peers,
-        'multicast': multicast ?? !Platform.isIOS,
-        'broadcast': broadcast,
-      });
+      // The build's peers first, then anything typed into the Radio panel on an earlier
+      // run. Both routes exist because the compile-time one is all there is before the
+      // app has ever been on the phone, and it is gone the moment somebody else builds.
+      final saved = _readStoredPeers(homePath);
+      _seedPeers = [...peers, ...saved.where((p) => !peers.contains(p))];
+
+      final auto = udpAutoDiscoveryDefault(isIOS: Platform.isIOS);
+      _multicast = multicast ?? auto;
+      _broadcast = broadcast ?? auto;
+
+      final reply = _ffi.start(startConfigJson(
+        home: homePath,
+        transport: _transport,
+        name: name ?? _defaultName(),
+        port: port,
+        peers: _seedPeers,
+        multicast: _multicast,
+        broadcast: _broadcast,
+      ));
 
       if (reply['type'] == 'error') {
         _startError = reply['message'] as String? ?? 'unknown error';
@@ -137,23 +332,95 @@ class MeshService extends ChangeNotifier {
 
       _eventTimer = Timer.periodic(const Duration(milliseconds: 200), (_) => _drainEvents());
       _refreshTimer = Timer.periodic(const Duration(seconds: 3), (_) => refresh());
-      _autoGpsTimer = Timer.periodic(const Duration(minutes: 2), (_) => _autoLogSafePlace());
+      _autoGpsTimer =
+          Timer.periodic(const Duration(minutes: 2), (_) => _autoShareLocation());
 
-      if (transport == MeshTransport.bluetooth) await _startBluetooth();
+      if (wantBle && _bleError == null) await _startBluetooth();
       refresh();
-      _autoLogSafePlace();
+      _autoShareLocation();
     } catch (e) {
       _startError = '$e';
     }
     notifyListeners();
   }
 
-  Future<void> _autoLogSafePlace() async {
+  /// Publish our own position periodically, so peers can place us and so a ghost has a
+  /// recent last-known fix.
+  ///
+  /// This deliberately does **not** file a safety report. It used to: every two minutes
+  /// it called `reportZone(..., 4)` - "this place is maximally safe" - from a GPS fix
+  /// with no human involved. Under a safe/unsafe model that is a machine casting a
+  /// safety vote about ground nobody looked at, which manufactures exactly the false
+  /// consensus the vote counts exist to prevent. A safety claim needs a person behind it.
+  Future<void> _autoShareLocation() async {
     if (!_started) return;
     final fix = await _currentFix();
-    if (fix != null) {
-      reportZone(fix.$1, fix.$2, 4); // 4 = Safe Level
-      _add(ChatKind.notice, 'auto-gps', '🟢 Safe Place logged to map (${fix.$1.toStringAsFixed(4)}, ${fix.$2.toStringAsFixed(4)})');
+    if (fix == null) return;
+    _call({'cmd': 'set_location', 'lat': fix.$1, 'lon': fix.$2});
+    _call({'cmd': 'share_location'});
+    refresh();
+  }
+
+  // ----------------------------------------------------------------- seed peers
+
+  /// The directory the core keeps its identity, contacts, networks and zones in, created
+  /// if it is not there yet.
+  Future<String> _resolveHome([String? override]) async {
+    final cached = _homePath;
+    if (override == null && cached != null) return cached;
+    final path =
+        override ?? '${(await getApplicationSupportDirectory()).path}/reunite';
+    final dir = Directory(path);
+    if (!dir.existsSync()) dir.createSync(recursive: true);
+    _homePath = path;
+    return path;
+  }
+
+  /// Peers the user typed in, one `host:port` per line.
+  ///
+  /// A plain text file beside the core's own state rather than a preferences plugin:
+  /// `shared_preferences` would be a new dependency, and an offline-first app taking on
+  /// another package to store one line is a bad trade.
+  File _peersFile(String home) => File('$home/peers.txt');
+
+  List<String> _readStoredPeers(String home) {
+    try {
+      final file = _peersFile(home);
+      if (!file.existsSync()) return const [];
+      return parsePeerList(file.readAsStringSync());
+    } catch (e) {
+      // A peer list we cannot read costs the peers, never the node.
+      debugPrint('could not read saved peers: $e');
+      return const [];
+    }
+  }
+
+  /// Save a `host:port` address for this node to dial directly. Returns an error string,
+  /// or null when it was saved.
+  ///
+  /// It reaches the transport at the **next start**, not now: seeds are handed to the UDP
+  /// socket when it binds. The UI says so rather than implying the peer is already live.
+  Future<String?> addPeer(String address) async {
+    final value = address.trim();
+    final err = peerAddressError(value);
+    if (err != null) return err;
+    if (_seedPeers.contains(value)) return null;
+    return _writePeers([..._seedPeers, value]);
+  }
+
+  /// Forget a saved peer. A typo nobody can delete is a trap, so this exists.
+  Future<String?> removePeer(String address) =>
+      _writePeers(_seedPeers.where((p) => p != address).toList());
+
+  Future<String?> _writePeers(List<String> peers) async {
+    try {
+      final home = await _resolveHome();
+      _peersFile(home).writeAsStringSync(peers.isEmpty ? '' : '${peers.join('\n')}\n');
+      _seedPeers = peers;
+      notifyListeners();
+      return null;
+    } catch (e) {
+      return 'could not save the peer list: $e';
     }
   }
 
@@ -225,18 +492,8 @@ class MeshService extends ChangeNotifier {
       _bleError = 'this device has no Bluetooth LE radio';
       return;
     }
-    if (!await _ble.isEnabled()) {
-      _bleError = 'Bluetooth is turned off - switch it on to reach other phones';
-      return;
-    }
-    final err = await _ble.start();
-    if (err != null) {
-      _bleError = err;
-      return;
-    }
-    _bleError = null;
 
-    // Frames arriving off the air go straight into the core.
+    // Subscribe *before* starting, so the first state the platform reports is not lost.
     _bleEvents = _ble.events().listen((event) {
       switch (event['type'] as String?) {
         case 'frame':
@@ -245,15 +502,51 @@ class MeshService extends ChangeNotifier {
         case 'peer_lost':
           _ffi.blePeerLost(event['device'] as String);
           break;
+        case 'rssi':
+          _ffi.bleRssi(event['device'] as String, event['rssi'] as int);
+          break;
+        case 'radio_state':
+          _onRadioState(event['state'] as String);
+          break;
         case 'log':
           debugPrint('BLE: ${event['message']}');
           break;
       }
     }, onError: (Object e) => debugPrint('BLE event stream error: $e'));
 
+    // Start unconditionally. The old code asked `isEnabled()` first and bailed out when
+    // it said no - but on iOS that question has no answer until CoreBluetooth has
+    // reported in, which it only does *after* a manager exists, which only `start()`
+    // creates. It therefore always said no, and the iPhone never advertised or scanned
+    // once. Power state now arrives asynchronously through `radio_state`, which is the
+    // shape CoreBluetooth actually has.
+    final err = await _ble.start();
+    if (err != null) {
+      _bleError = err;
+      return;
+    }
+    _bleError = null;
+
     // ...and frames the core wants sent go out to the radio. 100ms keeps beacons
     // punctual without waking the radio pointlessly.
     _bleTimer = Timer.periodic(const Duration(milliseconds: 100), (_) => _pumpBluetooth());
+  }
+
+  /// Act on a radio state the platform reported.
+  ///
+  /// Only these strings may produce a "Bluetooth is off" message. A diagnostic that
+  /// fires when the code does not actually know is worse than none: it sends someone to
+  /// check a setting that was already correct, and they believe it.
+  void _onRadioState(String state) {
+    _radioState = state;
+    if (state == 'on') {
+      _bleError = null;
+    } else {
+      // Leaves an existing error alone for 'unknown' and 'resetting': the platform is
+      // not claiming anything, so neither do we.
+      _bleError = bleErrorForRadioState(state) ?? _bleError;
+    }
+    notifyListeners();
   }
 
   Future<void> _pumpBluetooth() async {
@@ -333,9 +626,25 @@ class MeshService extends ChangeNotifier {
         _add(ChatKind.status, e['display'] as String, describeStatus(e['code'] as int));
         break;
       case 'zone_update':
-        _add(ChatKind.notice, e['from'] as String,
-            'reported a zone: ${(e['level_scaled'] as num).toStringAsFixed(1)}/4 safe, '
-            '${e['consensus']} verifying');
+        final verdict = e['verdict'] as String;
+        _add(
+          verdict == 'safe' ? ChatKind.notice : ChatKind.warning,
+          e['from'] as String,
+          'zone now reads $verdict within ${formatRadius(e['radius_m'] as int)} '
+          '(${e['safe_votes']} safe / ${e['unsafe_votes']} unsafe)',
+        );
+        break;
+      case 'cadence':
+        // The core decided the radio should ease off (or wake up). Pushing it down to
+        // the platform is what turns the ladder into actual battery: the scanner is the
+        // expensive half, and only Kotlin and Swift can reconfigure it.
+        _ble.setCadence(
+          scan: e['scan'] as String,
+          windowMs: e['window_ms'] as int?,
+          periodMs: e['period_ms'] as int?,
+        );
+        _cadence = e['scan'] as String;
+        notifyListeners();
         break;
       case 'peer_joined':
         _add(ChatKind.notice, e['display'] as String, 'is in range');
@@ -424,8 +733,21 @@ class MeshService extends ChangeNotifier {
     return code == 0 ? 'status cleared' : 'status $code';
   }
 
-  String? reportZone(double lat, double lon, int level) {
-    final err = _ok(_call({'cmd': 'report_zone', 'lat': lat, 'lon': lon, 'level': level}));
+  /// File a safe/unsafe report about the area around a point.
+  ///
+  /// [radiusM] is already in metres: the unit picker lives in the UI and converts, so
+  /// there is exactly one length unit below this line and no chance of a mixed-unit bug.
+  String? reportZone(double lat, double lon, bool safe, int radiusM) {
+    if (radiusM < kMinRadiusM || radiusM > kMaxRadiusM) {
+      return 'radius must be between $kMinRadiusM m and ${kMaxRadiusM ~/ 1000} km';
+    }
+    final err = _ok(_call({
+      'cmd': 'report_zone',
+      'lat': lat,
+      'lon': lon,
+      'verdict': safe ? 'safe' : 'unsafe',
+      'radius_m': radiusM,
+    }));
     refresh();
     return err;
   }
@@ -485,11 +807,11 @@ class MeshService extends ChangeNotifier {
     return err;
   }
 
-  /// Report the safety of wherever we are standing.
-  Future<String?> reportZoneHere(int level) async {
+  /// Report the area around wherever we are standing.
+  Future<String?> reportZoneHere(bool safe, int radiusM) async {
     final fix = await _currentFix();
     if (fix == null) return 'no GPS fix - cannot report a zone without a position';
-    return reportZone(fix.$1, fix.$2, level);
+    return reportZone(fix.$1, fix.$2, safe, radiusM);
   }
 
   Future<(double, double)?> _currentFix() async {

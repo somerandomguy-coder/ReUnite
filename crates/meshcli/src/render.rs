@@ -138,17 +138,30 @@ pub fn event_line(style: &Style, event: &Event, now_ms: u64) -> String {
         }
         Event::ZoneUpdate {
             cell,
-            level,
-            consensus,
+            verdict,
+            radius_m,
+            safe_votes,
+            unsafe_votes,
             from,
-        } => style.yellow(&format!(
-            "# zone {cell:x} is now {:.1}/{} safe, {consensus} verifying (via {from})",
-            zones::byte_to_level(*level),
-            zones::MAX_LEVEL
-        )),
+        } => {
+            let line = format!(
+                "# zone {cell:x} now reads {} within {} ({safe_votes} safe / {unsafe_votes} unsafe, via {from})",
+                verdict.as_str(),
+                zones::fmt_radius(*radius_m),
+            );
+            if verdict.is_safe() {
+                style.green(&line)
+            } else {
+                style.red(&line)
+            }
+        }
         Event::Delivered { to, preview } => {
             style.dim(&format!("\u{2713} delivered to {to}: \"{preview}\""))
         }
+        Event::Cadence { hello_ms, scan, .. } => style.dim(&format!(
+            "radio eased to a beacon every {}s ({scan}) - nothing has been heard for a while",
+            hello_ms / 1000
+        )),
         Event::Context(name) => style.dim(&format!("context: [{name}]")),
         Event::Notice(text) => style.yellow(&format!("! {text}")),
         Event::Warning(text) => style.red(&format!("! {text}")),
@@ -243,50 +256,47 @@ pub fn peers_table(style: &Style, peers: &[PeerView], now_ms: u64) -> String {
 pub fn heatmap_table(style: &Style, zones_view: &[ZoneView]) -> String {
     if zones_view.is_empty() {
         return style
-            .dim("no safety reports yet - add one with --report-zone [lat] [lon] [0-4]")
+            .dim("no safety reports yet - add one with --report-zone [lat] [lon] safe|unsafe [radius] [unit]")
             .to_string();
     }
     let mut out = String::new();
     out.push_str(&style.bold(&format!(
-        "{:<18} {:<12} {:<12} {:<10} {:<10} {:<6} {}\n",
-        "CELL", "LAT", "LON", "SAFETY", "CONSENSUS", "AGE", "MINE"
+        "{:<18} {:<12} {:<12} {:<9} {:<9} {:<7} {:<7} {:<6} {}\n",
+        "CELL", "LAT", "LON", "VERDICT", "RADIUS", "SAFE", "UNSAFE", "AGE", "MINE"
     )));
     for z in zones_view {
-        let level = zones::byte_to_level(z.level);
-        let bar = format!("{:<10}", format!("{:.1}/{}", level, zones::MAX_LEVEL));
-        let coloured = if level >= 3.0 {
-            style.green(&bar)
-        } else if level >= 1.5 {
-            style.yellow(&bar)
+        let verdict = format!("{:<9}", z.verdict.as_str());
+        let verdict = if z.verdict.is_safe() {
+            style.green(&verdict)
         } else {
-            style.red(&bar)
+            style.red(&verdict)
         };
-        // A cell one person called safe must not look like one thirty people confirmed.
-        let trust = format!(
-            "{:<10}",
-            match z.consensus {
-                0 | 1 => format!("{} (unverified)", z.consensus),
-                _ => z.consensus.to_string(),
-            }
-        );
-        let trust = match z.consensus {
-            0 | 1 => style.dim(&trust),
-            2..=3 => trust,
-            _ => style.bold(&trust),
+        // A cell one person called safe must not look like one thirty people confirmed,
+        // and a cell people disagree about must not look settled. Both counts, always.
+        let total = z.safe_votes + z.unsafe_votes;
+        let safe = format!("{:<7}", z.safe_votes);
+        let unsafe_col = format!("{:<7}", z.unsafe_votes);
+        let (safe, unsafe_col) = match total {
+            0 | 1 => (style.dim(&safe), style.dim(&unsafe_col)),
+            2..=3 => (safe, unsafe_col),
+            _ => (style.bold(&safe), style.bold(&unsafe_col)),
         };
         out.push_str(&format!(
-            "{:<18} {:<12.5} {:<12.5} {} {} {:<6} {}\n",
+            "{:<18} {:<12.5} {:<12.5} {} {:<9} {} {} {:<6} {}\n",
             format!("{:x}", z.cell),
             z.lat,
             z.lon,
-            coloured,
-            trust,
+            verdict,
+            zones::fmt_radius(z.radius_m),
+            safe,
+            unsafe_col,
             ago(z.age_ms),
             if z.mine { "yes" } else { "" }
         ));
     }
     out.push_str(&style.dim(
-        "safety 0 = dangerous, 4 = safe. consensus = how many distinct nodes reported it.",
+        "a cell is safe only when more people vouch for it than against it - a tie reads unsafe.\n\
+         radius is the mean of the reports that agree with the verdict.",
     ));
     out
 }
@@ -478,7 +488,8 @@ pub const HELP: &str = r#"commands (anything that does not start with -- is broa
                                        It does NOT call emergency services.
     --status [code|name]               send a pre-canned 1-byte message
                                        (--status with no argument lists them)
-    --report-zone [lat] [lon] [0-4]    report how safe a place is (0 = dangerous)
+    --report-zone [lat] [lon] safe|unsafe [radius] [unit]
+                                       is the area around a point safe? unit is m, km, ft or mi
     --heatmap show                     aggregated safe zones and how many verified each
 
   session

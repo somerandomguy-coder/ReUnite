@@ -21,7 +21,7 @@ pub const BEACON_VERSION: u8 = 1;
 pub const MAX_BEACON_BYTES: usize = 27;
 pub const HEADER_BYTES: usize = 4;
 pub const PRESENCE_BYTES: usize = 23;
-pub const ZONE_BYTES: usize = 22;
+pub const ZONE_BYTES: usize = 24;
 
 pub const TYPE_PRESENCE: u8 = 0;
 pub const TYPE_ZONE: u8 = 1;
@@ -89,16 +89,20 @@ pub struct Presence {
     pub ttl: u8,
 }
 
-/// Type 1 - "this hex cell is this safe, and this many of us agree".
+/// Type 1 - "the area around this hex cell is safe (or is not), and this many of us
+/// have an opinion about it".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Zone {
     pub origin: NodeId,
     /// H3 cell index.
     pub cell: u64,
-    /// Aggregated safety, 0 (dangerous) ..= 255 (safe).
-    pub level: u8,
+    /// `zones::WIRE_SAFE` or `zones::WIRE_UNSAFE`.
+    pub verdict: u8,
     /// Distinct reporters, saturating at 255. plan.md §3.2 "Trust Consensus".
     pub consensus: u8,
+    /// Radius the aggregate covers, in metres. Two bytes, which is what keeps the
+    /// whole advertisement inside the 27 usable bytes of a BLE manufacturer-data field.
+    pub radius_m: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,8 +166,9 @@ impl Beacon {
             Body::Zone(z) => {
                 bytes[4..12].copy_from_slice(&z.origin.0);
                 bytes[12..20].copy_from_slice(&z.cell.to_le_bytes());
-                bytes[20] = z.level;
+                bytes[20] = z.verdict;
                 bytes[21] = z.consensus;
+                bytes[22..24].copy_from_slice(&z.radius_m.to_le_bytes());
                 ZONE_BYTES
             }
         };
@@ -210,8 +215,9 @@ impl Beacon {
                 Body::Zone(Zone {
                     origin: NodeId(origin),
                     cell: u64::from_le_bytes(cell),
-                    level: bytes[20],
+                    verdict: bytes[20],
                     consensus: bytes[21],
+                    radius_m: u16::from_le_bytes([bytes[22], bytes[23]]),
                 })
             }
             other => return Err(BeaconError::UnknownType(other)),

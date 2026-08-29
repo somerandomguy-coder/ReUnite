@@ -13,12 +13,13 @@ crates/meshcore
       packet.rs     Frame / Packet wire format, TTL, path recording
       beacon.rs     Beacon v1: the 27-byte BLE-advertisement format (core-only)
       status.rs     pre-canned panic codes, one byte each (core-only)
-      zones.rs      H3 safe-zone aggregation and trust consensus
+      zones.rs      H3 safe/unsafe zone aggregation and trust consensus
       battery.rs    platform battery read, cached
       crypto.rs     Ed25519, X25519 sealed boxes, ChaCha20-Poly1305, HKDF
       identity.rs   persistent UUID -> node id + keys
       store.rs      identity.json, contacts.json, networks.json, zones.json, messages/*.jsonl
-      transport/    the radio seam: udp.rs today, BLE/Wi-Fi Direct later
+      duty.rs       how hard to beacon and scan, given how alone we are
+      transport/    the radio seam: udp.rs, external.rs (native BLE), multi.rs (all at once)
 ```
 
 `meshcore` has no terminal code in it and `meshcli` has no protocol code in it. That
@@ -82,7 +83,7 @@ no allocation.
 ```
 header (4 bytes)   ver/type | flags (SOS, GPS, status, relay) | battery | seq
 type 0 presence    node_id(8) lat_e7(4) lon_e7(4) status(1) hops(1) ttl(1)   = 23 bytes
-type 1 zone        origin(8) cell(8) level(1) consensus(1)                   = 22 bytes
+type 1 zone        origin(8) cell(8) verdict(1) consensus(1) radius_m(2)     = 24 bytes
 ```
 
 GPS is `i32` degrees × 1e7 (~1 cm, far finer than GPS itself). Phase 1 encodes, decodes
@@ -130,27 +131,137 @@ requirement from [proposal.md](../proposal.md) — with ghosts always below reac
   dimmed at its last known GPS fix with the age of that fix. A dead battery must not look
   the same as never having existed.
 
-## The safe-zone heat map
+## Safe and unsafe zones
 
 Raw coordinates would not scale: a hundred people in one street each broadcasting a
 distinct lat/lon is a storm with no useful aggregate at the end of it. So a report is
 snapped to an **H3 cell** (resolution 8, ≈460 m edge — about a town block) and only the
-cell travels, as an 8-byte index plus a level byte.
+cell travels: an 8-byte index, a verdict byte, and a 4-byte radius.
 
-Two rules make the number mean something:
+```rust
+NetPayload::Zone { cell: u64, verdict: u8, radius_m: u32 }
+```
+
+### One bit, not a scale
+
+Phase 1 carried a 0–4 safety level and averaged it across reporters. Phase 2B replaced it
+with a single **safe / unsafe** verdict, for three reasons found by reading the question
+out loud:
+
+* **Nobody can answer a five-point scale under stress.** "Is this a 2 or a 3?" has no
+  defensible answer at 3 a.m. in a flooded street. "Is it safe here — yes or no?" does.
+* **The mean turned disagreement into a lie.** Two people reporting 4 and two reporting 0
+  averaged to "2 — moderate": a sentence nobody said, painting a contested street amber.
+* **The reported area was not the reporter's to choose.** The cell was fixed whether the
+  person could vouch for their doorway or for the whole district. Now they say which, and
+  the radius travels with the verdict — it is the only thing the cell cannot express.
+
+### What makes the numbers mean something
 
 * **One report per node per cell**, latest wins. Otherwise one node could shout a street
-  green fifty times and manufacture agreement.
-* **Consensus is reported separately from level.** [plan.md](../plan.md) §3.2 requires a
-  reader see how many people verified a zone *before* the red/green gradient is trusted,
-  so `--heatmap show` gives it its own column and marks a single report `(unverified)`.
+  safe fifty times and manufacture agreement.
+* **Both vote counts travel separately**, never blended. [plan.md](../plan.md) §3.2
+  requires a reader see how many people verified a zone *before* trusting the colour, so
+  `--heatmap show` gives `SAFE` and `UNSAFE` their own columns and dims a lone report.
+* **A tie resolves to unsafe.** `safe_votes > unsafe_votes` is the only way a cell reads
+  safe. Painting a street green because two people disagreed with two others is the
+  failure mode that gets somebody hurt, and the false alarms are worth it. The same rule
+  decides draw order on the map: unsafe circles render on top, with a solid border.
+* **The radius is the mean of the reports that *agree* with the verdict.** Averaging
+  across disagreeing reporters would size the circle from people describing a different
+  claim about the same ground.
+* **Anything that is not an explicit `safe` byte decodes as unsafe.** A corrupted or
+  future-versioned value must never be able to clear a hazard.
+
+### Bounded re-gossip
 
 Reports expire after 6 hours. Each node re-gossips **its own** reports, one cell per
-5-second maintenance tick — never the aggregate, or the consensus count would compound as
+5-second maintenance tick — never the aggregate, or the vote counts would compound as
 reports bounce around the mesh. That round-robin is what lets a node that joins later, or
-that was still starting up when a report went past, converge onto the whole map; it also
-keeps a live node's reports fresh against the TTL while a node that has gone away stops
-refreshing and correctly ages out.
+that was still starting up when a report went past, converge onto the whole map.
+
+That ring is capped at **16 reports**, oldest evicted. Without a bound, a node that has
+walked across a city re-gossips a hundred cells forever; the cap is also what makes the
+structure portable to Phase 3, where it becomes a `heapless::Vec<Report, 16>` with a
+compile-time capacity rather than an allocation.
+
+Eviction stops a cell being *republished*. It does not withdraw the report — other nodes
+are still counting that vote, and silently retracting it would rewrite their map from
+under them. The report ages out on the same 6-hour TTL as everyone else's.
+
+### Drawing it
+
+The app renders each cell as a translucent circle of the reported radius, green for safe
+and red for unsafe, at 0.18 alpha per contributing report and capped at 0.75. Overlap
+density *is* the consensus signal — the darker the patch, the more people vouched for it —
+and the cap exists because a fully opaque overlay hides the map underneath, which is how
+somebody navigates out of the area.
+
+## Every radio at once
+
+Phase 2 made the radio a choice — the app started on Bluetooth *or* Wi-Fi, and changing
+it stopped and restarted the node. Phase 2D removed the choice. `MultiTransport` is a
+`Transport` over a set of `Transport`s:
+
+```
+send_broadcast  -> every child
+send_to(addr)   -> the child that address arrived on, or every child if unknown
+recv            -> whichever child speaks first
+```
+
+Routing, crypto, dedupe and the actor see one radio and did not change. A node reachable
+on two radios is still one peer: the router keys neighbours by `NodeId`, and the duplicate
+suppression that already handles a flooded packet arriving twice handles it arriving over
+two radios for free.
+
+**One dead radio must never take down the node.** `send_broadcast` succeeds if *any* child
+accepted the frame; only a total refusal is an error. A phone with Bluetooth off meshes
+over Wi-Fi, a Mac with no BLE peripheral role meshes over UDP, and neither is a failure
+state — it is Tuesday. Constructing a node with *no* radios is the one hard error, because
+there is nothing left to degrade to.
+
+Each child gets a pump task feeding a shared channel rather than a `select!` over a
+runtime-sized set of futures: `Transport::recv` is a single-consumer await, and cancelling
+one branch of a `select!` mid-`recv` is how frames go missing.
+
+## The duty cycle
+
+A node alone was beaconing every 3 seconds and scanning at the radio's lowest-latency
+setting forever — a flat battery by morning, spent on an empty room. `duty.rs` is a pure
+function from conditions to a cadence:
+
+| Alone for | Hello | Scan |
+| :--- | :--- | :--- |
+| peers present, or any SOS | 3 s | low latency |
+| 0 – 1 min | 3 s | low latency |
+| 1 – 5 min | 10 s | balanced |
+| 5 – 20 min | 30 s | low power, 5 s window every 30 s |
+| > 20 min | 60 s | low power, 5 s window every 60 s |
+
+Four rules shape it, and each is an asymmetry rather than a preference:
+
+* **The first minute alone is not solitude**, it is the join race. Backing off into it
+  would make two phones started together slower to find each other, which is the one
+  moment they must not be.
+* **Any frame from anyone resets to the top rung** — including one we cannot decrypt or a
+  version we do not understand. `last_heard_ms` is set in `on_frame` *before* the frame is
+  parsed. Being slow to notice a rescuer costs more than a few beacons do.
+* **An SOS never backs off**, ours or a peer's we are relaying. That is exactly the moment
+  to spend the battery.
+* **Scanning eases with the beacon.** Duty-cycling only the beacon — the obvious move —
+  saves very little: a receiver listening at full tilt costs far more than a transmitter
+  speaking occasionally.
+
+Below 15 % charge the node drops one rung further. That is what finally makes the battery
+byte in the beacon worth carrying.
+
+Every interval is jittered by ±20 %. Twenty phones that started together would otherwise
+beacon in lockstep forever and collide on air every time — worst exactly when the room is
+fullest.
+
+**iOS gets less out of this than Android.** CoreBluetooth has no scan-mode knob and no
+advertising-interval control; the only lever is stopping and restarting the scan, so only
+the window applies. Any drain measurement that assumes parity will be confusing.
 
 ## Identity and cryptography
 
@@ -240,6 +351,6 @@ Two mechanisms fake radio range:
 `cargo test` (18 tests) covers the sealed-box exchange, packet signing and tamper
 rejection, dedupe and route preference, the kick threshold and re-key, persistence across
 restarts, Beacon v1 byte-exact round-trips and its size budget, status-code parsing and
-the absence of human text on the wire, H3 cell snapping, zone consensus counting people
+the absence of human text on the wire, H3 cell snapping, zone votes counting people
 rather than reports, and a relay outside a private network being unable to read its SOS,
 status or zone traffic.

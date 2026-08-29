@@ -253,8 +253,9 @@ fn beacons_fit_a_ble_advertisement_and_round_trip_byte_exactly() {
         body: beacon::Body::Zone(beacon::Zone {
             origin: NodeId::from_uuid("bob"),
             cell: 0x8844c0a339fffff,
-            level: 191,
+            verdict: zones::WIRE_UNSAFE,
             consensus: 7,
+            radius_m: 750,
         }),
     };
     let encoded = zone.encode();
@@ -316,7 +317,7 @@ fn pre_canned_status_is_one_byte_and_parses_both_ways() {
 }
 
 #[test]
-fn zone_consensus_counts_people_not_reports() {
+fn a_zone_counts_people_on_each_side_and_never_blends_them() {
     let home = temp_home("zones");
     let mut book = ZoneBook::load(&home, zones::DEFAULT_RESOLUTION).unwrap();
     let cell = zones::cell_for(10.7769, 106.7009, zones::DEFAULT_RESOLUTION).unwrap();
@@ -326,20 +327,24 @@ fn zone_consensus_counts_people_not_reports() {
         NodeId::from_uuid("carol"),
     );
 
-    book.record(cell, alice, zones::level_to_byte(4), 1_000);
-    book.record(cell, bob, zones::level_to_byte(4), 1_100);
-    book.record(cell, carol, zones::level_to_byte(2), 1_200);
+    book.record(cell, alice, zones::Verdict::Safe, 500, 1_000);
+    book.record(cell, bob, zones::Verdict::Safe, 300, 1_100);
+    book.record(cell, carol, zones::Verdict::Unsafe, 400, 1_200);
     let zone = book.get(cell).unwrap();
-    assert_eq!(zone.consensus(), 3, "three distinct nodes verified this cell");
-    let mean = zones::byte_to_level(zone.level());
-    assert!((mean - 3.33).abs() < 0.1, "mean of 4,4,2 is ~3.33, got {mean}");
+    assert_eq!(zone.safe_votes(), 2);
+    assert_eq!(zone.unsafe_votes(), 1);
+    assert_eq!(zone.verdict(), zones::Verdict::Safe, "2 safe beats 1 unsafe");
+    assert_eq!(zone.consensus(), 3, "three distinct nodes have an opinion");
+    // The radius is the mean of the reports that *agree* with the verdict: 500 and 300,
+    // not carol's 400, which was describing a different claim about the same ground.
+    assert_eq!(zone.radius_m(), 400);
 
-    // A node shouting the same cell again replaces its own opinion and never inflates
-    // the consensus - that is what makes the number worth showing.
-    book.record(cell, carol, zones::level_to_byte(0), 1_300);
+    // A node changing its mind replaces its own vote and never inflates either count.
+    book.record(cell, carol, zones::Verdict::Safe, 400, 1_300);
     let zone = book.get(cell).unwrap();
+    assert_eq!(zone.safe_votes(), 3);
+    assert_eq!(zone.unsafe_votes(), 0);
     assert_eq!(zone.consensus(), 3, "re-reporting must not manufacture agreement");
-    assert!(zones::byte_to_level(zone.level()) < mean, "the lower report pulled it down");
 
     // Reports age out; a cell with nothing current left disappears entirely.
     assert!(book.prune(1_300 + zones::ZONE_TTL_MS + 1) >= 3);
@@ -347,19 +352,123 @@ fn zone_consensus_counts_people_not_reports() {
 }
 
 #[test]
-fn zones_and_their_consensus_survive_a_restart() {
+fn a_contested_cell_reads_unsafe_rather_than_splitting_the_difference() {
+    let home = temp_home("zonetie");
+    let mut book = ZoneBook::load(&home, zones::DEFAULT_RESOLUTION).unwrap();
+    let cell = zones::cell_for(51.5074, -0.1278, zones::DEFAULT_RESOLUTION).unwrap();
+
+    for (i, verdict) in [
+        zones::Verdict::Safe,
+        zones::Verdict::Safe,
+        zones::Verdict::Unsafe,
+        zones::Verdict::Unsafe,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        book.record(cell, NodeId::from_uuid(&format!("n{i}")), verdict, 250, 1_000);
+    }
+
+    let zone = book.get(cell).unwrap();
+    assert_eq!(zone.safe_votes(), 2);
+    assert_eq!(zone.unsafe_votes(), 2);
+    assert_eq!(
+        zone.verdict(),
+        zones::Verdict::Unsafe,
+        "a tie must resolve to unsafe - painting a contested street green is what hurts someone",
+    );
+
+    // And the disagreement stays visible rather than collapsing into one number.
+    let views = book.views(&NodeId::from_uuid("observer"), 1_000);
+    assert_eq!(views.len(), 1);
+    assert_eq!(views[0].safe_votes, 2);
+    assert_eq!(views[0].unsafe_votes, 2);
+}
+
+#[test]
+fn a_node_re_gossips_only_its_sixteen_most_recent_reports() {
+    let home = temp_home("zonering");
+    let mut book = ZoneBook::load(&home, zones::DEFAULT_RESOLUTION).unwrap();
+    let me = NodeId::from_uuid("me");
+
+    // Twenty distinct cells, walked in order.
+    let cells: Vec<u64> = (0..20)
+        .map(|i| {
+            zones::cell_for(10.0 + i as f64 * 0.05, 106.0, zones::DEFAULT_RESOLUTION).unwrap()
+        })
+        .collect();
+    for (i, cell) in cells.iter().enumerate() {
+        book.record_own(*cell, me, zones::Verdict::Safe, 200, 1_000 + i as u64);
+    }
+
+    let mine = book.mine(&me);
+    assert_eq!(
+        mine.len(),
+        zones::OWN_REPORT_CAPACITY,
+        "the re-gossip ring is bounded, or a node that has walked a city gossips forever",
+    );
+    let gossiped: Vec<u64> = mine.iter().map(|(c, _, _)| *c).collect();
+    assert!(!gossiped.contains(&cells[0]), "the oldest fell out of the ring");
+    assert!(gossiped.contains(&cells[19]), "the newest is in it");
+
+    // Eviction stops republishing. It must NOT withdraw the report itself - other nodes
+    // are still counting that vote, and silently retracting it would rewrite their map.
+    assert!(
+        book.get(cells[0]).unwrap().reports.contains_key(&me),
+        "an evicted report still stands, it is just no longer rebroadcast",
+    );
+
+    // Re-reporting a cell already in the ring moves it to the newest end instead of
+    // taking a second slot.
+    let before = book.mine(&me).len();
+    book.record_own(cells[19], me, zones::Verdict::Unsafe, 200, 2_000);
+    assert_eq!(book.mine(&me).len(), before, "no duplicate slot for one cell");
+    assert_eq!(book.mine(&me).last().unwrap().0, cells[19]);
+}
+
+#[test]
+fn a_radius_survives_whatever_unit_it_was_typed_in() {
+    // The same distance, three ways a person might type it.
+    let m = zones::to_metres(500.0, "m").unwrap();
+    let km = zones::to_metres(0.5, "km").unwrap();
+    let ft = zones::to_metres(1640.42, "ft").unwrap();
+    assert_eq!(m, 500);
+    assert_eq!(km, 500);
+    assert!((ft as i64 - 500).abs() <= 1, "1640.42 ft is 500 m, got {ft}");
+    assert_eq!(zones::to_metres(1.0, "mi").unwrap(), 1609);
+
+    // The limits are refusals, not silent clamps: someone who types the wrong unit must
+    // be told, not quietly given a different area than they asked for.
+    assert!(zones::to_metres(1.0, "m").is_err(), "below the minimum");
+    assert!(zones::to_metres(50.0, "km").is_err(), "past the maximum");
+    assert!(zones::to_metres(0.0, "m").is_err());
+    assert!(zones::to_metres(-5.0, "m").is_err());
+    assert!(zones::to_metres(100.0, "furlongs").is_err());
+
+    // A radius arriving off the wire from another build is clamped rather than refused -
+    // dropping the report would lose a hazard over a formatting disagreement.
+    assert_eq!(zones::clamp_radius(0), zones::MIN_RADIUS_M);
+    assert_eq!(zones::clamp_radius(u32::MAX), zones::MAX_RADIUS_M);
+}
+
+#[test]
+fn zones_and_their_votes_survive_a_restart() {
     let home = temp_home("zonepersist");
     let cell = zones::cell_for(-33.8688, 151.2093, zones::DEFAULT_RESOLUTION).unwrap();
+    let me = NodeId::from_uuid("a");
     {
         let mut book = ZoneBook::load(&home, zones::DEFAULT_RESOLUTION).unwrap();
-        book.record(cell, NodeId::from_uuid("a"), zones::level_to_byte(3), now_ms());
-        book.record(cell, NodeId::from_uuid("b"), zones::level_to_byte(3), now_ms());
+        book.record_own(cell, me, zones::Verdict::Unsafe, 750, now_ms());
+        book.record(cell, NodeId::from_uuid("b"), zones::Verdict::Unsafe, 250, now_ms());
         book.save().unwrap();
     }
     let book = ZoneBook::load(&home, zones::DEFAULT_RESOLUTION).unwrap();
     let zone = book.get(cell).expect("zone survived the restart");
-    assert_eq!(zone.consensus(), 2);
-    assert_eq!(zone.level(), zones::level_to_byte(3));
+    assert_eq!(zone.unsafe_votes(), 2);
+    assert_eq!(zone.verdict(), zones::Verdict::Unsafe);
+    assert_eq!(zone.radius_m(), 500, "mean of 750 and 250");
+    // The ring is persisted too, or a restart would republish in a different order.
+    assert_eq!(book.mine(&me), vec![(cell, zones::Verdict::Unsafe, 750)]);
 }
 
 #[test]
@@ -400,7 +509,11 @@ fn emergency_payloads_are_unreadable_outside_the_network() {
             gps: Some(Gps { lat: 10.7769, lon: 106.7009, ts_ms: 1 }),
         },
         NetPayload::Status { code: status::TRAPPED },
-        NetPayload::Zone { cell: 0x8844c0a339fffff, level: 200 },
+        NetPayload::Zone {
+            cell: 0x8844c0a339fffff,
+            verdict: zones::WIRE_UNSAFE,
+            radius_m: 800,
+        },
     ] {
         let plaintext = bincode::serialize(&payload).unwrap();
         let (nonce, ciphertext) = crypto::sym_encrypt(&key, &plaintext).unwrap();
@@ -444,4 +557,153 @@ fn a_hello_carries_battery_sos_and_status() {
     let mut forged = Frame::decode(&bytes).unwrap().packet;
     forged.body = Body::Hello(Hello { sos: false, ..hello.clone() });
     assert!(crypto::verify(&hello.ed_pub, &forged.signing_bytes(), &forged.sig).is_err());
+}
+
+// ---------------------------------------------------------------- phase 2D
+
+#[test]
+fn the_radio_eases_off_when_alone_and_snaps_back_when_anyone_appears() {
+    use meshcore::duty::{self, Conditions, ScanMode};
+
+    let alone = |ms: u64| {
+        duty::cadence(Conditions {
+            alone_for_ms: ms,
+            peers: 0,
+            sos: false,
+            battery: None,
+        })
+    };
+
+    // The first minute alone is the normal join race, not solitude: backing off into it
+    // would make two phones started together slower to find each other, which is the one
+    // moment they must not be.
+    assert_eq!(alone(0), duty::Cadence::ENGAGED);
+    assert_eq!(alone(59_000), duty::Cadence::ENGAGED);
+
+    // Then it climbs down, and the scan eases with the beacon - duty-cycling only the
+    // beacon saves very little, because listening is the expensive half.
+    assert_eq!(alone(2 * 60_000).hello.as_secs(), 10);
+    assert_eq!(alone(2 * 60_000).scan, ScanMode::Balanced);
+    assert_eq!(alone(10 * 60_000).hello.as_secs(), 30);
+    assert!(alone(10 * 60_000).scan_window.is_some());
+    assert_eq!(alone(60 * 60_000).hello.as_secs(), 60);
+
+    // It is monotonic: no rung is faster than the one before it.
+    let mut previous = alone(0).hello;
+    for minutes in [1, 3, 6, 15, 21, 120] {
+        let now = alone(minutes * 60_000).hello;
+        assert!(now >= previous, "cadence sped up at {minutes} minutes alone");
+        previous = now;
+    }
+
+    // One peer, after an hour alone, and it is back to the top rung immediately.
+    assert_eq!(
+        duty::cadence(Conditions {
+            alone_for_ms: 60 * 60_000,
+            peers: 1,
+            sos: false,
+            battery: None,
+        }),
+        duty::Cadence::ENGAGED,
+    );
+}
+
+#[test]
+fn an_sos_never_backs_off_however_alone_it_is() {
+    use meshcore::duty::{self, Conditions};
+
+    // Ours, or a peer's we are relaying. An SOS is exactly the moment to spend the
+    // battery, and a node that has been alone for hours is the one most likely to be
+    // raising one.
+    for battery in [None, Some(3), Some(100)] {
+        assert_eq!(
+            duty::cadence(Conditions {
+                alone_for_ms: 24 * 60 * 60_000,
+                peers: 0,
+                sos: true,
+                battery,
+            }),
+            duty::Cadence::ENGAGED,
+            "an SOS backed off with battery {battery:?}",
+        );
+    }
+}
+
+#[test]
+fn a_flat_battery_drops_one_further_rung_but_never_off_the_ladder() {
+    use meshcore::duty::{self, Conditions};
+
+    let at = |ms: u64, battery: Option<u8>| {
+        duty::cadence(Conditions {
+            alone_for_ms: ms,
+            peers: 0,
+            sos: false,
+            battery,
+        })
+    };
+
+    // This is what makes the battery byte in the beacon worth carrying: a nearly flat
+    // node should still be findable in an hour, and it will not be if it spends what is
+    // left talking to nobody.
+    assert!(at(2 * 60_000, Some(5)).hello > at(2 * 60_000, Some(80)).hello);
+    assert_eq!(at(2 * 60_000, Some(80)).hello, at(2 * 60_000, None).hello);
+
+    // The bottom rung is a floor, not a cliff - a flat node still beacons.
+    let bottom = at(24 * 60 * 60_000, Some(1));
+    assert_eq!(bottom.hello.as_secs(), 60);
+}
+
+#[test]
+fn jitter_spreads_nodes_without_drifting_the_rate() {
+    use core::time::Duration;
+    use meshcore::duty;
+
+    let base = Duration::from_secs(10);
+    let spread: Vec<u64> = (0..200)
+        .map(|seed| duty::jitter(base, seed).as_millis() as u64)
+        .collect();
+
+    // Every value inside ±20 %...
+    for value in &spread {
+        assert!((8_000..=12_000).contains(value), "jittered to {value}ms");
+    }
+    // ...and genuinely spread, or twenty phones that started together would beacon in
+    // lockstep and collide on air every single time - worst exactly when the room is
+    // fullest.
+    let distinct: std::collections::HashSet<u64> = spread.iter().copied().collect();
+    assert!(distinct.len() > 50, "only {} distinct delays", distinct.len());
+
+    // The mean stays put, so backing off does not secretly change the rate.
+    let mean = spread.iter().sum::<u64>() as f64 / spread.len() as f64;
+    assert!((mean - 10_000.0).abs() < 400.0, "mean drifted to {mean}ms");
+}
+
+/// A `zones.json` written by a build from before commit `df0bcbb` used `{"level": u8}`
+/// per report; the current `Report` needs `verdict` and `radius_m`. Upgrading an install
+/// across that change must not brick the node.
+///
+/// This is not hypothetical: it took an iPhone out entirely. `ZoneBook::load` returned
+/// the serde error, `Node::spawn` passed it up, and the app showed "the mesh core did not
+/// start" on every launch, forever, with no way back other than deleting the app.
+#[test]
+fn an_out_of_date_zones_file_does_not_stop_the_node_from_starting() {
+    let home = temp_home("zones-legacy");
+    std::fs::write(
+        home.join("zones.json"),
+        r#"{"zones":[{"cell":"8a2a1072b59ffff",
+             "reports":[["0102030405060708",{"level":200,"ts_ms":1000}]]}]}"#,
+    )
+    .unwrap();
+
+    let book = ZoneBook::load(&home, zones::DEFAULT_RESOLUTION)
+        .expect("a stale zone cache must degrade, not refuse to load");
+    let cell = u64::from_str_radix("8a2a1072b59ffff", 16).unwrap();
+    assert!(book.get(cell).is_none(), "unreadable votes are dropped, not invented");
+
+    // Quarantined rather than deleted: it is the only evidence of what went wrong, and
+    // this codebase does not destroy a user's file to make an error go away.
+    assert!(
+        home.join("zones.json.bad").exists(),
+        "the unreadable file should be kept for inspection"
+    );
 }

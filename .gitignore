@@ -16,3 +16,7 @@ mobile/ios/Frameworks/
 # always visible to whoever loads the page, but it must not be committed to
 # a public repo. Copy web/assets/js/config.example.js to config.js locally.
 web/assets/js/config.js
+# Editor swap files. `.Cargo.toml.swp` was committed once by accident; the pattern is
+# broad so the next one never is.
+*.sw[a-p]
+*~

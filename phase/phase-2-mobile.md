@@ -87,8 +87,10 @@ change. Swapping to `flutter_rust_bridge` later would touch only `crates/meshffi
 - [x] Slide-to-activate SOS (never a plain tap — accidental activation is the failure mode).
 - [x] A persistent, unmissable banner while SOS is active, and an explicit stop control.
 - [x] On-screen text stating this alerts the local mesh **only**, not emergency services.
-- [x] Large one-tap buttons for the Phase 1 status codes: I am safe / Need medical /
-      Need water-food / Trapped / Moving / Shelter here / Hazard. One tap sends one byte.
+- [x] Large one-tap buttons for the Phase 1 status codes. One tap sends one byte.
+      Shipped as seven; commit `6eba821` cut the displayed table to three — Safe / Hazard /
+      SOS — and the remaining four stay decodable so a mixed-version mesh loses nothing.
+      See [`phase-2a`](phase-2a-build-and-display-integrity.md) §2A.2.
 
 ## Step 2.4 — Chat, networks, onboarding
 
@@ -147,7 +149,7 @@ change. Swapping to `flutter_rust_bridge` later would touch only `crates/meshffi
 * `MeshService` rewritten on the real core. **The mock is gone**: no hard-coded node id,
   no fake peer.
 * All four screens: Chat, Peers (compass/grid + ghosts + battery + SOS), Emergency
-  (slide-to-SOS, seven panic buttons sourced from the Rust table, zone reporter, heat map
+  (slide-to-SOS, panic buttons sourced from the Rust table, zone reporter, heat map
   with consensus), Networks (create, invite, switch, storing, kick).
 * `scripts/build_ffi.sh` for macOS / Android / iOS, and `docs/MOBILE.md`.
 * Android multicast lock in `MainActivity.kt` - without it Android silently discards mesh
