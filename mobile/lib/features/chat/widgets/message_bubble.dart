@@ -9,6 +9,7 @@ class MessageBubble extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final isLocation = message.type == MessageType.location;
+    final isSos = message.type == MessageType.sos;
 
     return Align(
       alignment: message.isMe ? Alignment.centerRight : Alignment.centerLeft,
@@ -16,11 +17,26 @@ class MessageBubble extends StatelessWidget {
         margin: const EdgeInsets.symmetric(vertical: 4),
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
         decoration: BoxDecoration(
-          color: isLocation
-              ? (message.isMe ? Colors.teal.shade800 : Colors.teal.shade900)
-              : (message.isMe ? Colors.amber.shade800 : const Color(0xFF2A2A2A)),
+          color: isSos
+              ? (message.isMe ? Colors.red.shade900 : Colors.redAccent.shade700)
+              : isLocation
+                  ? (message.isMe ? Colors.teal.shade800 : Colors.teal.shade900)
+                  : (message.isMe ? Colors.amber.shade800 : const Color(0xFF2A2A2A)),
           borderRadius: BorderRadius.circular(16),
-          border: isLocation ? Border.all(color: Colors.cyan, width: 1) : null,
+          border: isSos
+              ? Border.all(color: Colors.redAccent, width: 2)
+              : isLocation
+                  ? Border.all(color: Colors.cyan, width: 1)
+                  : null,
+          boxShadow: isSos
+              ? [
+                  BoxShadow(
+                    color: Colors.red.withOpacity(0.5),
+                    blurRadius: 8,
+                    spreadRadius: 2,
+                  )
+                ]
+              : null,
         ),
         child: Column(
           crossAxisAlignment:
@@ -32,8 +48,8 @@ class MessageBubble extends StatelessWidget {
                 if (!message.isMe) ...[
                   Text(
                     message.senderName,
-                    style: const TextStyle(
-                      color: Colors.cyan,
+                    style: TextStyle(
+                      color: isSos ? Colors.yellowAccent : Colors.cyan,
                       fontSize: 12,
                       fontWeight: FontWeight.bold,
                     ),
@@ -47,7 +63,7 @@ class MessageBubble extends StatelessWidget {
                     borderRadius: BorderRadius.circular(8),
                   ),
                   child: Text(
-                    message.hops == 1 ? '1 hop (direct)' : '${message.hops} hops',
+                    isSos ? '🚨 SOS BEACON (0.3s)' : (message.hops == 1 ? '1 hop (direct)' : '${message.hops} hops'),
                     style: const TextStyle(
                       color: Colors.white70,
                       fontSize: 10,
@@ -57,7 +73,39 @@ class MessageBubble extends StatelessWidget {
               ],
             ),
             const SizedBox(height: 4),
-            if (isLocation) ...[
+            if (isSos) ...[
+              const Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.warning_amber_rounded, color: Colors.yellowAccent, size: 20),
+                  SizedBox(width: 6),
+                  Text(
+                    'HIGH PRIORITY SOS BEACON',
+                    style: TextStyle(
+                      color: Colors.yellowAccent,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 13,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 4),
+              Text(
+                message.text,
+                style: const TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.bold),
+              ),
+              if (message.lat != null && message.lon != null) ...[
+                const SizedBox(height: 4),
+                Text(
+                  'GPS: ${message.lat!.toStringAsFixed(5)}, ${message.lon!.toStringAsFixed(5)}',
+                  style: const TextStyle(
+                    color: Colors.yellowAccent,
+                    fontFamily: 'monospace',
+                    fontSize: 12,
+                  ),
+                ),
+              ],
+            ] else if (isLocation) ...[
               const Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
