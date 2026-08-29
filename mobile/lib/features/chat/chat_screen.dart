@@ -41,7 +41,7 @@ class _ChatScreenState extends State<ChatScreen> {
             child: meshService.messages.isEmpty
                 ? const Center(
                     child: Text(
-                      'No messages yet in [default]\nType a message below to broadcast over BLE',
+                      'No messages yet in [default]\nType a message or tap 📍 to share GPS over BLE',
                       textAlign: TextAlign.center,
                       style: TextStyle(color: Colors.grey),
                     ),
@@ -56,10 +56,23 @@ class _ChatScreenState extends State<ChatScreen> {
                   ),
           ),
           Container(
-            padding: const EdgeInsets.all(8.0),
+            padding: const EdgeInsets.symmetric(horizontal: 8.0, vertical: 4.0),
             color: const Color(0xFF1E1E1E),
             child: Row(
               children: [
+                IconButton(
+                  tooltip: 'Share Offline GPS Location',
+                  icon: const Icon(Icons.my_location, color: Colors.cyan),
+                  onPressed: () async {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text('Sharing GPS location over BLE mesh...'),
+                        duration: Duration(seconds: 1),
+                      ),
+                    );
+                    await meshService.shareCurrentLocation();
+                  },
+                ),
                 Expanded(
                   child: TextField(
                     controller: _textController,
