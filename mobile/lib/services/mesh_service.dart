@@ -34,7 +34,7 @@ class ChatMessageModel {
 
 class MeshService extends ChangeNotifier {
   String _activeNetwork = "default";
-  String _nodeId = "565c7b6a6af53c06";
+  final String _nodeId = "565c7b6a6af53c06";
   final List<PeerNode> _peers = [];
   final List<ChatMessageModel> _messages = [];
 
