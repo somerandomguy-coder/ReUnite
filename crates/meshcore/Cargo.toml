@@ -3,7 +3,9 @@ name = "meshcore"
 description = "Offline P2P emergency mesh: identity, crypto, packets, routing, transports"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+[lib]
+name = "meshcore"
+crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
 anyhow.workspace = true

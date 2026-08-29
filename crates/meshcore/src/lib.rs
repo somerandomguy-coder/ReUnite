@@ -15,6 +15,7 @@
 pub mod battery;
 pub mod beacon;
 pub mod crypto;
+pub mod ffi;
 pub mod geo;
 pub mod identity;
 pub mod net;
