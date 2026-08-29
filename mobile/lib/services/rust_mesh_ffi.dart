@@ -43,7 +43,16 @@ class RustMeshFFI {
         } else {
           _lib = DynamicLibrary.process();
         }
-      } else if (Platform.isIOS || Platform.isMacOS) {
+      } else if (Platform.isMacOS) {
+        // scripts/build_ffi.sh macos installs the dylib here.
+        final home = Platform.environment['HOME'];
+        final path = home == null ? null : '$home/.reunite/lib/libmeshffi.dylib';
+        if (path != null && File(path).existsSync()) {
+          _lib = DynamicLibrary.open(path);
+        }
+      } else if (Platform.isIOS) {
+        // scripts/build_ffi.sh ios produces a static library linked directly into
+        // the app binary (see docs/MOBILE.md), so its symbols are already in-process.
         _lib = DynamicLibrary.process();
       }
 
