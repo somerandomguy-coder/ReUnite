@@ -296,6 +296,15 @@ CREATE TABLE IF NOT EXISTS safe_zones (
     last_reporter TEXT NOT NULL,
     updated_at_ms INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS breadcrumbs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lat REAL NOT NULL,
+    lon REAL NOT NULL,
+    cell_id TEXT NOT NULL,
+    is_safe INTEGER NOT NULL DEFAULT 1,
+    ts_ms INTEGER NOT NULL
+);
 "#;
 
 /// High-level Database & Persistence Manager for ReUnite

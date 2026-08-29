@@ -226,64 +226,37 @@ class _TransportPicker extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const Text('Radio', style: TextStyle(fontWeight: FontWeight.bold)),
+        const Text('Active Radio Engine', style: TextStyle(fontWeight: FontWeight.bold)),
         const SizedBox(height: 6),
-        SegmentedButton<MeshTransport>(
-          segments: [
-            const ButtonSegment(
-              value: MeshTransport.wifi,
-              icon: Icon(Icons.wifi, size: 18),
-              label: Text('Wi-Fi'),
-            ),
-            ButtonSegment(
-              value: MeshTransport.bluetooth,
-              icon: const Icon(Icons.bluetooth, size: 18),
-              label: const Text('Bluetooth'),
-              enabled: mesh.bluetoothAvailable,
-            ),
-          ],
-          selected: {mesh.transport},
-          onSelectionChanged: (selection) async {
-            final to = selection.first;
-            if (to == mesh.transport) return;
-            final messenger = ScaffoldMessenger.of(context);
-            messenger.showSnackBar(SnackBar(
-              content: Text('switching to ${to == MeshTransport.bluetooth ? 'Bluetooth' : 'Wi-Fi'}...'),
-              duration: const Duration(seconds: 1),
-            ));
-            await mesh.switchTransport(to);
-          },
-        ),
-        const SizedBox(height: 6),
-        if (!mesh.bluetoothAvailable)
-          const Text(
-            'Bluetooth mesh runs on phones. A laptop cannot advertise as a BLE peripheral, '
-            'so desktops stay on Wi-Fi.',
-            style: TextStyle(fontSize: 11, color: Colors.grey),
-          )
-        else if (mesh.transport == MeshTransport.bluetooth) ...[
-          if (mesh.bleError != null)
-            Row(children: [
-              const Icon(Icons.error_outline, size: 14, color: Colors.orangeAccent),
-              const SizedBox(width: 6),
+        Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: Colors.blue.shade900.withOpacity(0.2),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: Colors.cyanAccent.withOpacity(0.5)),
+          ),
+          child: Row(
+            children: [
+              const Icon(Icons.bluetooth, color: Colors.cyanAccent),
+              const SizedBox(width: 10),
               Expanded(
-                child: Text(mesh.bleError!,
-                    style: const TextStyle(fontSize: 11, color: Colors.orangeAccent)),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('Bluetooth Low Energy (BLE) Mesh',
+                        style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                    Text(
+                      mesh.bleConnected == 0
+                          ? 'Scanning for surrounding phone radios...'
+                          : 'Connected to ${mesh.bleConnected} peer phone(s) off-grid.',
+                      style: const TextStyle(fontSize: 11, color: Colors.grey),
+                    ),
+                  ],
+                ),
               ),
-            ])
-          else
-            Text(
-              mesh.bleConnected == 0
-                  ? 'Searching for other phones... keep the app open on both.'
-                  : 'Connected to ${mesh.bleConnected} phone(s) over Bluetooth. No Wi-Fi needed.',
-              style: TextStyle(
-                fontSize: 11,
-                color: mesh.bleConnected == 0 ? Colors.grey : Colors.tealAccent,
-              ),
-            ),
-        ] else
-          const Text('Every device must be on the same Wi-Fi or hotspot.',
-              style: TextStyle(fontSize: 11, color: Colors.grey)),
+            ],
+          ),
+        ),
       ],
     );
   }
