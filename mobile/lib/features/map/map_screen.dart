@@ -227,30 +227,31 @@ class _InteractiveMapViewState extends State<_InteractiveMapView> {
 
     return Stack(
       children: [
-        FlutterMap(
-          mapController: _mapController,
-          options: MapOptions(
-            initialCenter: center,
-            initialZoom: 15.0,
-            maxZoom: 18.0,
-            minZoom: 3.0,
-          ),
-          children: [
-            // Dark off-grid fallback background canvas
-            Container(color: const Color(0xFF111827)),
-            TileLayer(
-              urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-              userAgentPackageName: 'com.reunite.reunite_mobile',
-              errorTileCallback: (tile, error, stackTrace) {
-                // Silently swallow tile load errors off-grid
-              },
+        ColoredBox(
+          color: const Color(0xFF111827),
+          child: FlutterMap(
+            mapController: _mapController,
+            options: MapOptions(
+              initialCenter: center,
+              initialZoom: 15.0,
+              maxZoom: 18.0,
+              minZoom: 3.0,
             ),
-            // Builtin offline range rings (500m & 1500m)
-            CircleLayer(circles: offlineRangeCircles),
-            // Reported safety zones
-            CircleLayer(circles: circles),
-            MarkerLayer(markers: markers),
-          ],
+            children: [
+              TileLayer(
+                urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                userAgentPackageName: 'com.reunite.reunite_mobile',
+                errorTileCallback: (tile, error, stackTrace) {
+                  // Silently swallow tile load errors off-grid
+                },
+              ),
+              // Builtin offline range rings (500m & 1500m)
+              CircleLayer(circles: offlineRangeCircles),
+              // Reported safety zones
+              CircleLayer(circles: circles),
+              MarkerLayer(markers: markers),
+            ],
+          ),
         ),
 
         Positioned(
