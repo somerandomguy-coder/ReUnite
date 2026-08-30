@@ -128,7 +128,27 @@ class _InteractiveMapViewState extends State<_InteractiveMapView> {
     // area, and drawing it as a point would overstate what the reporter actually said.
     final circles = _zoneCircles(widget.mesh.zones);
 
-    // Add peer position markers with battery level display
+    // Builtin offline distance range circles centered on user position
+    final offlineRangeCircles = <CircleMarker>[
+      CircleMarker(
+        point: center,
+        radius: 500,
+        useRadiusInMeter: true,
+        color: Colors.cyan.withValues(alpha: 0.05),
+        borderColor: Colors.cyanAccent.withValues(alpha: 0.25),
+        borderStrokeWidth: 1.0,
+      ),
+      CircleMarker(
+        point: center,
+        radius: 1500,
+        useRadiusInMeter: true,
+        color: Colors.cyan.withValues(alpha: 0.03),
+        borderColor: Colors.cyanAccent.withValues(alpha: 0.15),
+        borderStrokeWidth: 1.0,
+      ),
+    ];
+
+    // Add peer position markers with battery level display and tap detail sheet
     for (final p in widget.mesh.peers) {
       if (p.hasPosition) {
         final isLowBattery = p.battery != null && p.battery! <= 15;
@@ -138,63 +158,66 @@ class _InteractiveMapViewState extends State<_InteractiveMapView> {
             point: LatLng(p.lat!, p.lon!),
             width: 80,
             height: 60,
-            child: Tooltip(
-              message: "${p.display}${p.battery != null ? ' · 🔋${p.battery}%' : ''}${p.sos ? ' · 🚨 SOS EMERGENCY' : ''}",
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(
-                    p.sos ? Icons.warning_amber_rounded : Icons.account_circle,
-                    color: p.sos
-                        ? Colors.redAccent
-                        : (p.ghost ? Colors.grey : Colors.cyanAccent),
-                    size: 26,
-                  ),
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
-                    decoration: BoxDecoration(
-                      color: Colors.black87,
-                      borderRadius: BorderRadius.circular(4),
-                      border: Border.all(
-                        color: p.sos
-                            ? Colors.redAccent
-                            : (isLowBattery ? Colors.orangeAccent : Colors.cyanAccent),
-                        width: 0.8,
-                      ),
+            child: GestureDetector(
+              onTap: () => _showPeerDetails(context, p),
+              child: Tooltip(
+                message: "${p.display}${p.battery != null ? ' · 🔋${p.battery}%' : ''}${p.sos ? ' · 🚨 SOS EMERGENCY' : ''}",
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      p.sos ? Icons.warning_amber_rounded : Icons.account_circle,
+                      color: p.sos
+                          ? Colors.redAccent
+                          : (p.ghost ? Colors.grey : Colors.cyanAccent),
+                      size: 26,
                     ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Flexible(
-                          child: Text(
-                            p.display,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                                color: Colors.white,
-                                fontWeight: FontWeight.bold,
-                                fontSize: 9),
-                          ),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                      decoration: BoxDecoration(
+                        color: Colors.black87,
+                        borderRadius: BorderRadius.circular(4),
+                        border: Border.all(
+                          color: p.sos
+                              ? Colors.redAccent
+                              : (isLowBattery ? Colors.orangeAccent : Colors.cyanAccent),
+                          width: 0.8,
                         ),
-                        if (p.battery != null) ...[
-                          const SizedBox(width: 2),
-                          Icon(
-                            isLowBattery ? Icons.battery_alert : Icons.battery_full,
-                            size: 9,
-                            color: battColor,
-                          ),
-                          Text(
-                            "${p.battery}%",
-                            style: TextStyle(
-                              fontSize: 9,
-                              fontWeight: FontWeight.w600,
-                              color: battColor,
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Flexible(
+                            child: Text(
+                              p.display,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 9),
                             ),
                           ),
+                          if (p.battery != null) ...[
+                            const SizedBox(width: 2),
+                            Icon(
+                              isLowBattery ? Icons.battery_alert : Icons.battery_full,
+                              size: 9,
+                              color: battColor,
+                            ),
+                            Text(
+                              "${p.battery}%",
+                              style: TextStyle(
+                                fontSize: 9,
+                                fontWeight: FontWeight.w600,
+                                color: battColor,
+                              ),
+                            ),
+                          ],
                         ],
-                      ],
+                      ),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
             ),
           ),
@@ -213,6 +236,8 @@ class _InteractiveMapViewState extends State<_InteractiveMapView> {
             minZoom: 3.0,
           ),
           children: [
+            // Dark off-grid fallback background canvas
+            Container(color: const Color(0xFF111827)),
             TileLayer(
               urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
               userAgentPackageName: 'com.reunite.reunite_mobile',
@@ -220,7 +245,9 @@ class _InteractiveMapViewState extends State<_InteractiveMapView> {
                 // Silently swallow tile load errors off-grid
               },
             ),
-            // Under the markers: the zones are context, the peers are the subject.
+            // Builtin offline range rings (500m & 1500m)
+            CircleLayer(circles: offlineRangeCircles),
+            // Reported safety zones
             CircleLayer(circles: circles),
             MarkerLayer(markers: markers),
           ],
@@ -262,7 +289,7 @@ class _InteractiveMapViewState extends State<_InteractiveMapView> {
                       ),
                       Text(
                         "${widget.mesh.zones.length} reported zones · "
-                        "safety reports are never sent automatically",
+                        "off-grid vector grid fallback active",
                         style: const TextStyle(color: Colors.grey, fontSize: 10),
                       ),
                     ],
@@ -277,6 +304,38 @@ class _InteractiveMapViewState extends State<_InteractiveMapView> {
                 ),
               ],
             ),
+          ),
+        ),
+
+        // Floating Zoom Controls at Right Center
+        Positioned(
+          right: 12,
+          top: 80,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              FloatingActionButton.small(
+                heroTag: "btn_zoom_in",
+                backgroundColor: Colors.black87,
+                foregroundColor: Colors.greenAccent,
+                child: const Icon(Icons.add),
+                onPressed: () {
+                  final zoom = _mapController.camera.zoom;
+                  _mapController.move(_mapController.camera.center, zoom + 1.0);
+                },
+              ),
+              const SizedBox(height: 6),
+              FloatingActionButton.small(
+                heroTag: "btn_zoom_out",
+                backgroundColor: Colors.black87,
+                foregroundColor: Colors.greenAccent,
+                child: const Icon(Icons.remove),
+                onPressed: () {
+                  final zoom = _mapController.camera.zoom;
+                  _mapController.move(_mapController.camera.center, zoom - 1.0);
+                },
+              ),
+            ],
           ),
         ),
 
@@ -323,6 +382,140 @@ class _InteractiveMapViewState extends State<_InteractiveMapView> {
               ),
             ],
           ),
+        ),
+      ],
+    );
+  }
+
+  void _showPeerDetails(BuildContext context, Peer peer) {
+    final batt = peer.battery;
+    final isLowBatt = batt != null && batt <= 15;
+
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF1E293B),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (ctx) {
+        return Padding(
+          padding: const EdgeInsets.all(20.0),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Icon(
+                    peer.sos ? Icons.warning_amber_rounded : Icons.person_pin,
+                    color: peer.sos ? Colors.redAccent : Colors.cyanAccent,
+                    size: 32,
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          peer.display,
+                          style: const TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.white,
+                          ),
+                        ),
+                        Text(
+                          "ID: ${peer.id.length >= 16 ? peer.id.substring(0, 16) : peer.id}…",
+                          style: const TextStyle(fontSize: 12, color: Colors.grey),
+                        ),
+                      ],
+                    ),
+                  ),
+                  if (batt != null)
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      decoration: BoxDecoration(
+                        color: isLowBatt ? Colors.red.shade900 : Colors.green.shade900,
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            isLowBatt ? Icons.battery_alert : Icons.battery_full,
+                            size: 14,
+                            color: Colors.white,
+                          ),
+                          const SizedBox(width: 4),
+                          Text(
+                            "$batt%",
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.bold,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                ],
+              ),
+              const Divider(height: 24, color: Colors.white24),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceAround,
+                children: [
+                  _infoChip(
+                    "Link",
+                    peer.ghost ? "Ghost" : (peer.direct ? "Direct" : "Relayed"),
+                    peer.direct ? Colors.greenAccent : Colors.orangeAccent,
+                  ),
+                  if (peer.hops != null)
+                    _infoChip("Hops", "${peer.hops}", Colors.cyanAccent),
+                  if (peer.rssi != null)
+                    _infoChip("RSSI", "${peer.rssi} dBm", Colors.amberAccent),
+                  if (peer.distanceM != null)
+                    _infoChip(
+                      "Distance",
+                      formatDistance(peer.distanceM!),
+                      Colors.greenAccent,
+                    ),
+                ],
+              ),
+              const SizedBox(height: 16),
+              if (peer.sos)
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: Colors.red.shade900.withValues(alpha: 0.5),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: Colors.redAccent),
+                  ),
+                  child: const Text(
+                    "🚨 SOS EMERGENCY BEACON ACTIVE",
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      color: Colors.redAccent,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 13,
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _infoChip(String label, String value, Color color) {
+    return Column(
+      children: [
+        Text(label, style: const TextStyle(color: Colors.grey, fontSize: 10)),
+        const SizedBox(height: 2),
+        Text(
+          value,
+          style: TextStyle(color: color, fontWeight: FontWeight.bold, fontSize: 13),
         ),
       ],
     );
