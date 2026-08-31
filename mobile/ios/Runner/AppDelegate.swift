@@ -43,7 +43,17 @@ import UIKit
         case "isSupported":
           result(true)
         case "isEnabled":
-          result(self.ble?.isEnabled ?? false)
+          // Through `radio()`, not `self.ble?`. Reading the optional returned false on
+          // every fresh launch - the radio is not constructed until something asks for
+          // it - and Dart treated that as "Bluetooth is off" and refused to start,
+          // telling the user to switch on a radio that was already on. That single
+          // `?.` is why an iPhone never advertised or scanned.
+          result(self.radio().isEnabled)
+        case "state":
+          // Best current knowledge. Before CoreBluetooth has reported in this is
+          // "unknown", which is the honest answer and is what stops the UI asserting a
+          // cause it has not established.
+          result(self.ble.map { BleMesh.describe($0.currentState) } ?? "unknown")
         case "start":
           if let error = self.radio().start() {
             result(FlutterError(code: "BLE_START_FAILED", message: error, details: nil))
@@ -55,6 +65,14 @@ import UIKit
           result(true)
         case "connectedCount":
           result(self.ble?.connectedCount ?? 0)
+        case "setCadence":
+          let args = call.arguments as? [String: Any] ?? [:]
+          self.radio().setCadence(
+            scan: args["scan"] as? String ?? "low_latency",
+            windowMs: args["windowMs"] as? Int,
+            periodMs: args["periodMs"] as? Int
+          )
+          result(true)
         case "send":
           guard let args = call.arguments as? [String: Any],
                 let frame = args["frame"] as? String
@@ -87,6 +105,19 @@ import UIKit
         NSLog("ReUnite BLE: %@", message)
         DispatchQueue.main.async {
           self?.events?(["type": "log", "message": message])
+        }
+      },
+      onState: { [weak self] state in
+        // The only authoritative answer to "is Bluetooth on". CoreBluetooth delivers it
+        // asynchronously and never before a manager exists, so it is pushed rather than
+        // polled - any synchronous answer before this point is a guess.
+        DispatchQueue.main.async {
+          self?.events?(["type": "radio_state", "state": state])
+        }
+      },
+      onRssi: { [weak self] device, rssi in
+        DispatchQueue.main.async {
+          self?.events?(["type": "rssi", "device": device, "rssi": rssi])
         }
       }
     )

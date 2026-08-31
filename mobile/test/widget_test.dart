@@ -1,4 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:reunite_mobile/features/map/map_screen.dart';
 import 'package:reunite_mobile/models/mesh_models.dart';
 import 'package:reunite_mobile/services/mesh_service.dart';
 
@@ -57,33 +58,62 @@ void main() {
     expect(ghost.hops, isNull);
   });
 
-  test('a zone exposes consensus separately from its level', () {
-    final verified = Zone.fromJson(const {
+  test('a zone keeps both vote counts apart instead of blending them', () {
+    final contested = Zone.fromJson(const {
       'cell': '8865b5662bfffff',
       'lat': 10.77508,
       'lon': 106.69941,
-      'level': 191,
-      'level_scaled': 3.0,
-      'consensus': 2,
+      'verdict': 'unsafe',
+      'radius_m': 750,
+      'safe_votes': 2,
+      'unsafe_votes': 3,
       'age_ms': 2000,
       'mine': false,
     });
-    expect(verified.levelScaled, 3.0);
-    expect(verified.consensus, 2);
-    expect(verified.verified, isTrue);
+    expect(contested.isSafe, isFalse);
+    expect(contested.radiusM, 750);
+    expect(contested.safeVotes, 2);
+    expect(contested.unsafeVotes, 3);
+    expect(contested.totalVotes, 5);
+    // Disagreement is its own state. "3 say unsafe" and "3 say unsafe, 2 say safe" are
+    // different claims, and the UI has to be able to tell them apart.
+    expect(contested.contested, isTrue);
+    expect(contested.verified, isTrue);
 
     final lone = Zone.fromJson(const {
       'cell': '8865b5662bfffff',
       'lat': 0.0,
       'lon': 0.0,
-      'level': 255,
-      'level_scaled': 4.0,
-      'consensus': 1,
+      'verdict': 'safe',
+      'radius_m': 100,
+      'safe_votes': 1,
+      'unsafe_votes': 0,
       'age_ms': 0,
       'mine': true,
     });
     // One person calling a street safe is not a verified zone, and the UI dims it.
+    expect(lone.isSafe, isTrue);
     expect(lone.verified, isFalse);
+    expect(lone.contested, isFalse);
+  });
+
+  test('a typed length becomes metres, whatever unit it was typed in', () {
+    expect(RadiusUnit.metres.toMetres(500), 500);
+    expect(RadiusUnit.kilometres.toMetres(0.5), 500);
+    expect(RadiusUnit.feet.toMetres(1640.42), 500);
+    expect(RadiusUnit.miles.toMetres(1), 1609);
+  });
+
+  test('overlapping reports darken, and never reach full opacity', () {
+    final one = zoneAlpha(1);
+    final three = zoneAlpha(3);
+    final many = zoneAlpha(50);
+    expect(one, lessThan(three));
+    expect(three, lessThan(many));
+    // The cap is what keeps the map readable underneath the overlay - which is how
+    // somebody actually navigates out of the area.
+    expect(many, lessThanOrEqualTo(0.75));
+    expect(one, greaterThan(0.0));
   });
 
   test('whoami carries the emergency state the banner reads', () {
@@ -128,5 +158,88 @@ void main() {
     expect(formatAge(38000), '38s ago');
     expect(formatAge(2 * 60000), '2m ago');
     expect(formatAge(3 * 3600000), '3h ago');
+  });
+
+  test('iOS is given neither UDP broadcast nor multicast, because it may not have them',
+      () {
+    // Apple gates both paths, sending and receiving, behind
+    // com.apple.developer.networking.multicast - a restricted entitlement this build does
+    // not hold, so those frames never reach the wire. Asking for them anyway would only
+    // make the core's describe() advertise reach the transport does not have.
+    expect(udpAutoDiscoveryDefault(isIOS: true), isFalse);
+    expect(udpAutoDiscoveryDefault(isIOS: false), isTrue);
+  });
+
+  test('the start config an iPhone sends has discovery off and keeps every seed', () {
+    final config = startConfigJson(
+      home: '/tmp/reunite',
+      transport: MeshTransport.all,
+      name: 'iphone',
+      port: 47474,
+      peers: const ['10.17.158.195:47474'],
+      multicast: udpAutoDiscoveryDefault(isIOS: true),
+      broadcast: udpAutoDiscoveryDefault(isIOS: true),
+    );
+    expect(config['broadcast'], isFalse);
+    expect(config['multicast'], isFalse);
+    // Unicast to an address it was given is the whole of the iPhone's Wi-Fi reach, so
+    // the seed list has to survive the crossing intact.
+    expect(config['peers'], const ['10.17.158.195:47474']);
+    expect(config['transport'], 'all');
+    expect(config['port'], 47474);
+
+    // The same call on a laptop keeps the discovery it can actually use.
+    final onMac = startConfigJson(
+      home: '/tmp/reunite',
+      transport: MeshTransport.all,
+      name: 'mac',
+      port: 47474,
+      peers: const [],
+      multicast: udpAutoDiscoveryDefault(isIOS: false),
+      broadcast: udpAutoDiscoveryDefault(isIOS: false),
+    );
+    expect(onMac['broadcast'], isTrue);
+    expect(onMac['multicast'], isTrue);
+  });
+
+  test('a peer list reads the same from a --dart-define and from the saved file', () {
+    // --dart-define=MESH_PEERS=a,b
+    expect(parsePeerList('10.17.158.195:47474,192.168.1.42:47474'),
+        ['10.17.158.195:47474', '192.168.1.42:47474']);
+    // ...and the file the Radio panel writes, one per line, comments allowed.
+    expect(parsePeerList('# saved peers\n10.17.158.195:47474\n192.168.1.42:47474\n'),
+        ['10.17.158.195:47474', '192.168.1.42:47474']);
+    expect(parsePeerList(''), isEmpty);
+    expect(parsePeerList('  ,  \n'), isEmpty);
+  });
+
+  test('an address that is not host:port is refused before the core drops it in silence',
+      () {
+    expect(peerAddressError('10.17.158.195:47474'), isNull);
+    expect(peerAddressError('  10.17.158.195:47474  '), isNull);
+    expect(peerAddressError('[fe80::1]:47474'), isNull);
+
+    // The core parses seeds with filter_map(..ok()), so a typo costs the peer and says
+    // nothing at all. This is the only place a person finds out.
+    expect(peerAddressError('10.17.158.195'), contains('port'));
+    expect(peerAddressError('10.17.158.195:'), contains('port'));
+    expect(peerAddressError('10.17.158.195:47474x'), contains('port'));
+    expect(peerAddressError('10.17.158.195:99999'), contains('port'));
+    expect(peerAddressError('   '), isNotNull);
+  });
+
+  test('only a state the platform reported may accuse the radio', () {
+    // The states the platform actually asserted.
+    expect(bleErrorForRadioState('off'), contains('turned off'));
+    expect(bleErrorForRadioState('unauthorized'), contains('permission'));
+    expect(bleErrorForRadioState('unsupported'), contains('no Bluetooth'));
+
+    // The states where it has declined to answer. Turning these into a diagnosis is the
+    // bug that kept iOS off the mesh: the app told people to switch on Bluetooth that
+    // was already on, and they believed it.
+    expect(bleErrorForRadioState('unknown'), isNull);
+    expect(bleErrorForRadioState('resetting'), isNull);
+    expect(bleErrorForRadioState('on'), isNull);
+    expect(bleErrorForRadioState('something-a-future-os-invents'), isNull);
   });
 }

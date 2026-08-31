@@ -23,6 +23,8 @@ typedef _DrainNative = Pointer<Utf8> Function();
 typedef _DrainDart = Pointer<Utf8> Function();
 typedef _LostNative = Void Function(Pointer<Utf8>);
 typedef _LostDart = void Function(Pointer<Utf8>);
+typedef _RssiNative = Void Function(Pointer<Utf8>);
+typedef _RssiDart = void Function(Pointer<Utf8>);
 typedef _StopNative = Bool Function();
 typedef _StopDart = bool Function();
 
@@ -35,6 +37,11 @@ class MeshFfiException implements Exception {
 
 class MeshFfi {
   final DynamicLibrary _lib;
+
+  /// True when this instance is the do-nothing stub built because the core would not
+  /// load. Callers must check it before trusting any reply: the stub returns null for
+  /// every call, which decodes to an empty, meaningless reply.
+  final bool isStub;
   late final _StartDart _start;
   late final _CommandDart _command;
   late final _PollDart _poll;
@@ -43,9 +50,10 @@ class MeshFfi {
   late final _DrainDart _bleDrain;
   late final _CommandDart _bleInject;
   late final _LostDart _blePeerLost;
+  late final _RssiDart _bleRssi;
   late final _StopDart _stop;
 
-  MeshFfi._(this._lib) {
+  MeshFfi._(this._lib) : isStub = false {
     _start = _lib.lookupFunction<_StartNative, _StartDart>('mesh_start');
     _command = _lib.lookupFunction<_CommandNative, _CommandDart>('mesh_command');
     _poll = _lib.lookupFunction<_PollNative, _PollDart>('mesh_poll_event');
@@ -54,27 +62,43 @@ class MeshFfi {
     _bleDrain = _lib.lookupFunction<_DrainNative, _DrainDart>('mesh_ble_drain');
     _bleInject = _lib.lookupFunction<_CommandNative, _CommandDart>('mesh_ble_inject');
     _blePeerLost = _lib.lookupFunction<_LostNative, _LostDart>('mesh_ble_peer_lost');
+    _bleRssi = _lib.lookupFunction<_RssiNative, _RssiDart>('mesh_ble_rssi');
     _stop = _lib.lookupFunction<_StopNative, _StopDart>('mesh_stop');
   }
 
   static MeshFfi? _instance;
   static bool _hasLoadedNative = false;
+  static String? _loadError;
+
+  /// False when the core could not be loaded and every call is going to the stub.
+  static bool get nativeLoaded => _hasLoadedNative;
+
+  /// Why the core could not be loaded, or null when it did load.
+  ///
+  /// `_open()` builds a precise message naming every path it tried. Without this getter
+  /// that message was thrown away and the stub's null replies surfaced to the user as
+  /// "empty reply from core" - a sentence that describes the symptom and hides the cause.
+  static String? get loadError => _loadError;
 
   static MeshFfi get instance {
     if (_instance == null) {
       try {
         _instance = MeshFfi._(_open());
         _hasLoadedNative = true;
+        _loadError = null;
       } catch (e) {
         debugPrint('[MeshFfi] Native C-library loading warning: $e');
         _instance = MeshFfi._mock();
         _hasLoadedNative = false;
+        _loadError = e is MeshFfiException ? e.message : '$e';
       }
     }
     return _instance!;
   }
 
-  MeshFfi._mock() : _lib = DynamicLibrary.process() {
+  MeshFfi._mock()
+      : _lib = DynamicLibrary.process(),
+        isStub = true {
     _start = (_) => nullptr;
     _command = (_) => nullptr;
     _poll = (_) => nullptr;
@@ -83,6 +107,7 @@ class MeshFfi {
     _bleDrain = () => nullptr;
     _bleInject = (_) => nullptr;
     _blePeerLost = (_) => {};
+    _bleRssi = (_) => {};
     _stop = () => true;
   }
 
@@ -204,6 +229,19 @@ class MeshFfi {
     final input = device.toNativeUtf8();
     try {
       _blePeerLost(input);
+    } finally {
+      calloc.free(input);
+    }
+  }
+
+  /// Tell the core how strong a device's signal was, in dBm.
+  ///
+  /// Fire-and-forget: this arrives several times a second per device in range, and the
+  /// core only keeps the latest. It is deliberately not a `command` round trip.
+  void bleRssi(String device, int rssi) {
+    final input = jsonEncode({'device': device, 'rssi': rssi}).toNativeUtf8();
+    try {
+      _bleRssi(input);
     } finally {
       calloc.free(input);
     }

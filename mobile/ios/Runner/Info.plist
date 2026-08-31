@@ -33,6 +33,8 @@
 		<string>bluetooth-central</string>
 		<string>bluetooth-peripheral</string>
 	</array>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>ReUnite requires local network access to find other phones and laptops running ReUnite on the same Wi-Fi or hotspot. Nothing leaves that network and no internet connection is used.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>ReUnite requires location access to share GPS position with emergency responders over the mesh.</string>
 	<key>UILaunchStoryboardName</key>

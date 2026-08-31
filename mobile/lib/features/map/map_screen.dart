@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
@@ -20,11 +22,15 @@ class MapScreen extends StatelessWidget {
       child: Scaffold(
         appBar: AppBar(
           title: const Text('Interactive Disaster Map & Radar'),
+          // Compass/Grid first, deliberately. plan.md §4 step 2.2 makes graceful
+          // degradation a hard requirement: a phone in a disaster usually has no tiles
+          // and no internet, so the view that works without either is the one it lands
+          // on. The interactive map is the opt-in, not the default.
           bottom: const TabBar(
             indicatorColor: Colors.greenAccent,
             tabs: [
-              Tab(icon: Icon(Icons.map), text: "Interactive Map"),
               Tab(icon: Icon(Icons.radar), text: "Peer Radar"),
+              Tab(icon: Icon(Icons.map), text: "Interactive Map"),
             ],
           ),
           actions: [
@@ -38,8 +44,8 @@ class MapScreen extends StatelessWidget {
         body: TabBarView(
           physics: const NeverScrollableScrollPhysics(), // Disable swipe so map drag works seamlessly
           children: [
-            _InteractiveMapView(mesh: mesh, me: me),
             _RadarView(mesh: mesh, me: me),
+            _InteractiveMapView(mesh: mesh, me: me),
           ],
         ),
       ),
@@ -68,58 +74,128 @@ class _InteractiveMapViewState extends State<_InteractiveMapView> {
 
     final markers = <Marker>[];
 
+    final myBattery = widget.me?.battery;
+
     // Current user position marker
     markers.add(
       Marker(
         point: center,
-        width: 50,
-        height: 50,
-        child: const Column(
-          children: [
-            Icon(Icons.person_pin_circle, color: Colors.greenAccent, size: 36),
-            Text("YOU",
-                style: TextStyle(
-                    color: Colors.greenAccent,
-                    fontWeight: FontWeight.bold,
-                    fontSize: 10,
-                    backgroundColor: Colors.black87)),
-          ],
+        width: 70,
+        height: 60,
+        child: Tooltip(
+          message: "YOU ${myBattery != null ? '· 🔋$myBattery%' : ''}",
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.person_pin_circle, color: Colors.greenAccent, size: 34),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                decoration: BoxDecoration(
+                  color: Colors.black87,
+                  borderRadius: BorderRadius.circular(4),
+                  border: Border.all(color: Colors.greenAccent, width: 0.8),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Text("YOU",
+                        style: TextStyle(
+                            color: Colors.greenAccent,
+                            fontWeight: FontWeight.bold,
+                            fontSize: 9)),
+                    if (myBattery != null) ...[
+                      const SizedBox(width: 2),
+                      Icon(
+                        myBattery <= 15 ? Icons.battery_alert : Icons.battery_full,
+                        size: 9,
+                        color: myBattery <= 15 ? Colors.redAccent : Colors.greenAccent,
+                      ),
+                      Text("$myBattery%",
+                          style: TextStyle(
+                              fontSize: 9,
+                              color: myBattery <= 15 ? Colors.redAccent : Colors.white)),
+                    ],
+                  ],
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
 
-    // Add safe zone markers and hazard markers from mesh.zones
-    for (final z in widget.mesh.zones) {
-      final isSafe = z.level >= 2;
-      markers.add(
-        Marker(
-          point: LatLng(z.lat, z.lon),
-          width: 44,
-          height: 44,
-          child: Tooltip(
-            message: isSafe ? "🟢 Safe Zone (${z.consensus} Node Consensus)" : "⚠️ Hazard Area",
-            child: Icon(
-              isSafe ? Icons.verified_user : Icons.dangerous,
-              color: isSafe ? Colors.greenAccent : Colors.redAccent,
-              size: 32,
-            ),
-          ),
-        ),
-      );
-    }
+    // Zones are drawn as circles, not pins. A pin claims a point; a report is about an
+    // area, and drawing it as a point would overstate what the reporter actually said.
+    final circles = _zoneCircles(widget.mesh.zones);
 
-    // Add peer position markers
+    // Add peer position markers with battery level display
     for (final p in widget.mesh.peers) {
       if (p.hasPosition) {
+        final isLowBattery = p.battery != null && p.battery! <= 15;
+        final battColor = isLowBattery ? Colors.redAccent : Colors.greenAccent;
         markers.add(
           Marker(
             point: LatLng(p.lat!, p.lon!),
-            width: 40,
-            height: 40,
-            child: Icon(
-              p.sos ? Icons.warning_amber_rounded : Icons.account_circle,
-              color: p.sos ? Colors.redAccent : Colors.cyanAccent,
-              size: 28,
+            width: 80,
+            height: 60,
+            child: Tooltip(
+              message: "${p.display}${p.battery != null ? ' · 🔋${p.battery}%' : ''}${p.sos ? ' · 🚨 SOS EMERGENCY' : ''}",
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    p.sos ? Icons.warning_amber_rounded : Icons.account_circle,
+                    color: p.sos
+                        ? Colors.redAccent
+                        : (p.ghost ? Colors.grey : Colors.cyanAccent),
+                    size: 26,
+                  ),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                    decoration: BoxDecoration(
+                      color: Colors.black87,
+                      borderRadius: BorderRadius.circular(4),
+                      border: Border.all(
+                        color: p.sos
+                            ? Colors.redAccent
+                            : (isLowBattery ? Colors.orangeAccent : Colors.cyanAccent),
+                        width: 0.8,
+                      ),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Flexible(
+                          child: Text(
+                            p.display,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                                color: Colors.white,
+                                fontWeight: FontWeight.bold,
+                                fontSize: 9),
+                          ),
+                        ),
+                        if (p.battery != null) ...[
+                          const SizedBox(width: 2),
+                          Icon(
+                            isLowBattery ? Icons.battery_alert : Icons.battery_full,
+                            size: 9,
+                            color: battColor,
+                          ),
+                          Text(
+                            "${p.battery}%",
+                            style: TextStyle(
+                              fontSize: 9,
+                              fontWeight: FontWeight.w600,
+                              color: battColor,
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
         );
@@ -144,8 +220,16 @@ class _InteractiveMapViewState extends State<_InteractiveMapView> {
                 // Silently swallow tile load errors off-grid
               },
             ),
+            // Under the markers: the zones are context, the peers are the subject.
+            CircleLayer(circles: circles),
             MarkerLayer(markers: markers),
           ],
+        ),
+
+        Positioned(
+          left: 12,
+          bottom: 12,
+          child: _ZoneLegend(zones: widget.mesh.zones),
         ),
 
         // Floating Control Card at Top
@@ -158,7 +242,7 @@ class _InteractiveMapViewState extends State<_InteractiveMapView> {
             decoration: BoxDecoration(
               color: Colors.black87,
               borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: Colors.greenAccent.withOpacity(0.5)),
+              border: Border.all(color: Colors.greenAccent.withValues(alpha: 0.5)),
             ),
             child: Row(
               children: [
@@ -170,14 +254,15 @@ class _InteractiveMapViewState extends State<_InteractiveMapView> {
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       const Text(
-                        "2-Min Auto GPS Safe Breadcrumb Active",
+                        "Sharing your position every 2 minutes",
                         style: TextStyle(
                             color: Colors.greenAccent,
                             fontWeight: FontWeight.bold,
                             fontSize: 12),
                       ),
                       Text(
-                        "${widget.mesh.zones.length} safe/hazard zones merged over BLE",
+                        "${widget.mesh.zones.length} reported zones · "
+                        "safety reports are never sent automatically",
                         style: const TextStyle(color: Colors.grey, fontSize: 10),
                       ),
                     ],
@@ -252,15 +337,27 @@ class _RadarView extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Naming the radio in use, rather than hard-coding "BLE", is not cosmetic: the
+    // previous text told a macOS user meshing over Wi-Fi to switch on Bluetooth, which
+    // would have done nothing and cost them the time it takes to try.
+    final radioName = mesh.radioNames;
     return ListView(
       children: [
-        PeerRadar(peers: mesh.peers, myLat: me?.lat, myLon: me?.lon),
-        const Padding(
-          padding: EdgeInsets.symmetric(horizontal: 16),
+        // The caption goes above the radar: it says what you are looking at, and a
+        // legend under a full-height square is a legend nobody scrolls to.
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 10, 16, 6),
           child: Text(
-            'Compass mode: bearing and distance from you over off-grid BLE Radio Mesh.',
-            style: TextStyle(color: Colors.grey, fontSize: 11),
+            'Compass mode: bearing and distance from you, over $radioName. '
+            'Circles are reported zones, labelled safe/unsafe votes.',
+            style: const TextStyle(color: Colors.grey, fontSize: 11),
           ),
+        ),
+        PeerRadar(
+          peers: mesh.peers,
+          zones: mesh.zones,
+          myLat: me?.lat,
+          myLon: me?.lon,
         ),
         const Divider(height: 24),
         Padding(
@@ -268,7 +365,7 @@ class _RadarView extends StatelessWidget {
           child: Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              const Text('Reachable Peers (BLE Mesh)',
+              const Text('Reachable peers',
                   style: TextStyle(fontWeight: FontWeight.bold)),
               Text(
                 '${mesh.livePeers.length} live · ${mesh.ghosts.length} ghost',
@@ -278,13 +375,14 @@ class _RadarView extends StatelessWidget {
           ),
         ),
         if (mesh.peers.isEmpty)
-          const Padding(
-            padding: EdgeInsets.all(28),
+          Padding(
+            padding: const EdgeInsets.all(28),
             child: Text(
-              'Scanning for nearby BLE survivors...\n\n'
-              'Ensure Bluetooth is turned on to reach surrounding phones.',
+              'No peers heard yet.\n\n'
+              'Still listening on $radioName. Anyone who comes into range appears here '
+              'on their own, with no action from you.',
               textAlign: TextAlign.center,
-              style: TextStyle(color: Colors.grey),
+              style: const TextStyle(color: Colors.grey),
             ),
           ),
         ...mesh.peers.map((p) => _PeerTile(peer: p, mesh: mesh)),
@@ -355,6 +453,118 @@ class _PeerTile extends StatelessWidget {
           peer.distanceM != null ? formatDistance(peer.distanceM!) : '—',
           style: TextStyle(color: peer.ghost ? Colors.grey : Colors.greenAccent),
         ),
+      ),
+    );
+  }
+}
+
+// --------------------------------------------------------------------- zone overlay
+
+/// Opacity contributed by one report. Chosen so overlaps stack readably: one circle sits
+/// at 0.18, two compose to ~0.33, five to ~0.63.
+const double _kZoneAlphaPerLayer = 0.18;
+
+/// Composited alpha never goes past this. A fully opaque overlay hides the map under it,
+/// and the map under it is how somebody navigates out of the area.
+const double _kZoneAlphaCap = 0.75;
+
+const Color kSafeGreen = Color(0xFF22C55E);
+const Color kUnsafeRed = Color(0xFFEF4444);
+
+/// Alpha for a zone with [votes] people behind it.
+///
+/// This is the same arithmetic that repeated alpha compositing performs, applied once
+/// from the vote count rather than by drawing N circles on top of each other. Drawing
+/// them individually would be honest too, but it costs N draws per cell and produces
+/// banding where circles share an edge.
+double zoneAlpha(int votes) {
+  final layers = votes.clamp(1, 20);
+  final composited = 1 - math.pow(1 - _kZoneAlphaPerLayer, layers).toDouble();
+  return composited.clamp(0.0, _kZoneAlphaCap);
+}
+
+/// Zones as map circles.
+///
+/// Unsafe draws **last**, so it lands on top wherever the two overlap, and carries a
+/// solid border. Same reasoning as the core resolving a tie to unsafe: contested ground
+/// must not look settled.
+List<CircleMarker> _zoneCircles(List<Zone> zones) {
+  final safe = zones.where((z) => z.isSafe);
+  final unsafe = zones.where((z) => !z.isSafe);
+  CircleMarker build(Zone z) {
+    final colour = z.isSafe ? kSafeGreen : kUnsafeRed;
+    return CircleMarker(
+      point: LatLng(z.lat, z.lon),
+      // In metres, so the circle stays geographically true through zoom instead of
+      // being a fixed blob of pixels that means a different distance at every level.
+      radius: z.radiusM.toDouble(),
+      useRadiusInMeter: true,
+      color: colour.withValues(alpha: zoneAlpha(z.totalVotes)),
+      borderColor: colour.withValues(alpha: z.isSafe ? 0.5 : 0.9),
+      borderStrokeWidth: z.isSafe ? 1 : 2,
+    );
+  }
+
+  return [...safe.map(build), ...unsafe.map(build)];
+}
+
+/// An opacity gradient with no key is decoration, not data.
+class _ZoneLegend extends StatelessWidget {
+  final List<Zone> zones;
+  const _ZoneLegend({required this.zones});
+
+  @override
+  Widget build(BuildContext context) {
+    if (zones.isEmpty) return const SizedBox.shrink();
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: Colors.black87,
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Text('People reporting',
+              style: TextStyle(fontSize: 10, color: Colors.grey)),
+          const SizedBox(height: 4),
+          Row(mainAxisSize: MainAxisSize.min, children: [
+            for (final votes in [1, 3, 5])
+              Padding(
+                padding: const EdgeInsets.only(right: 6),
+                child: Column(children: [
+                  Container(
+                    width: 20,
+                    height: 20,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: kSafeGreen.withValues(alpha: zoneAlpha(votes)),
+                      border: Border.all(
+                          color: kSafeGreen.withValues(alpha: 0.5), width: 1),
+                    ),
+                  ),
+                  Text(votes == 5 ? '5+' : '$votes',
+                      style: const TextStyle(fontSize: 9, color: Colors.grey)),
+                ]),
+              ),
+            const SizedBox(width: 6),
+            Column(children: [
+              Container(
+                width: 20,
+                height: 20,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: kUnsafeRed.withValues(alpha: zoneAlpha(3)),
+                  border:
+                      Border.all(color: kUnsafeRed.withValues(alpha: 0.9), width: 2),
+                ),
+              ),
+              const Text('unsafe',
+                  style: TextStyle(fontSize: 9, color: Colors.grey)),
+            ]),
+          ]),
+        ],
       ),
     );
   }

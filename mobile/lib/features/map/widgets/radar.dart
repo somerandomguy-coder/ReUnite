@@ -2,6 +2,7 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 
 import '../../../models/mesh_models.dart';
+import '../map_screen.dart' show kSafeGreen, kUnsafeRed, zoneAlpha;
 
 /// Compass / Grid mode.
 ///
@@ -11,10 +12,17 @@ import '../../../models/mesh_models.dart';
 /// at the centre - which is what someone walking towards a person actually needs.
 class PeerRadar extends StatelessWidget {
   final List<Peer> peers;
+  final List<Zone> zones;
   final double? myLat;
   final double? myLon;
 
-  const PeerRadar({super.key, required this.peers, this.myLat, this.myLon});
+  const PeerRadar({
+    super.key,
+    required this.peers,
+    this.zones = const [],
+    this.myLat,
+    this.myLon,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -27,7 +35,9 @@ class PeerRadar extends StatelessWidget {
             'placed by bearing and distance around you.',
       );
     }
-    if (located.isEmpty) {
+    // Zones alone are worth drawing. Bailing out here when no *peer* has a position
+    // would hide a reported hazard on the only screen that works without tiles.
+    if (located.isEmpty && zones.isEmpty) {
       return const _RadarMessage(
         icon: Icons.radar,
         title: 'No peer has shared a position yet',
@@ -39,7 +49,8 @@ class PeerRadar extends StatelessWidget {
       child: Padding(
         padding: const EdgeInsets.all(12),
         child: CustomPaint(
-          painter: _RadarPainter(peers: located, myLat: myLat!, myLon: myLon!),
+          painter:
+              _RadarPainter(peers: located, zones: zones, myLat: myLat!, myLon: myLon!),
           child: const SizedBox.expand(),
         ),
       ),
@@ -77,10 +88,28 @@ class _RadarMessage extends StatelessWidget {
 
 class _RadarPainter extends CustomPainter {
   final List<Peer> peers;
+  final List<Zone> zones;
   final double myLat;
   final double myLon;
 
-  _RadarPainter({required this.peers, required this.myLat, required this.myLon});
+  _RadarPainter({
+    required this.peers,
+    required this.zones,
+    required this.myLat,
+    required this.myLon,
+  });
+
+  static const double _earthR = 6371000;
+
+  /// Great-circle distance from us to a point, in metres.
+  double _distance(double lat2, double lon2) {
+    final p1 = myLat * math.pi / 180, p2 = lat2 * math.pi / 180;
+    final dp = (lat2 - myLat) * math.pi / 180;
+    final dl = (lon2 - myLon) * math.pi / 180;
+    final a = math.sin(dp / 2) * math.sin(dp / 2) +
+        math.cos(p1) * math.cos(p2) * math.sin(dl / 2) * math.sin(dl / 2);
+    return 2 * _earthR * math.atan2(math.sqrt(a), math.sqrt(1 - a));
+  }
 
   /// Initial great-circle bearing from us to a point, in degrees clockwise from north.
   double _bearing(double lat2, double lon2) {
@@ -115,6 +144,46 @@ class _RadarPainter extends CustomPainter {
     canvas.drawLine(
         Offset(centre.dx - maxR, centre.dy), Offset(centre.dx + maxR, centre.dy), grid);
     _label(canvas, Offset(centre.dx - 4, centre.dy - maxR - 16), 'N', Colors.cyan, 11);
+
+    // Zones, drawn as range rings before the peers so the peers stay legible on top.
+    // plan.md §4 step 2.2: Compass/Grid must carry the same information as the map, since
+    // a phone in a disaster usually has no tiles - and a hazard is exactly the thing that
+    // must not be visible only in the view that needs the internet.
+    for (final zone in zones) {
+      final distance = _distance(zone.lat, zone.lon);
+      final centreR = furthest <= 0 ? 0.0 : maxR * math.sqrt(distance / furthest);
+      final theta = (_bearing(zone.lat, zone.lon) - 90) * math.pi / 180;
+      final at = centre + Offset(centreR * math.cos(theta), centreR * math.sin(theta));
+
+      // The radius scales the same way the distances do, so a circle keeps its size
+      // relative to the rings rather than being drawn at a lying scale.
+      final outer = furthest <= 0
+          ? 0.0
+          : maxR * math.sqrt((distance + zone.radiusM) / furthest) - centreR;
+      final colour = zone.isSafe ? kSafeGreen : kUnsafeRed;
+      canvas.drawCircle(
+        at,
+        math.max(outer, 6),
+        Paint()..color = colour.withValues(alpha: zoneAlpha(zone.totalVotes)),
+      );
+      canvas.drawCircle(
+        at,
+        math.max(outer, 6),
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = zone.isSafe ? 1 : 2
+          ..color = colour.withValues(alpha: zone.isSafe ? 0.5 : 0.9),
+      );
+      // The vote counts travel with the shape, not just with the list. An opacity on its
+      // own cannot say "and four people disagree".
+      _label(
+        canvas,
+        at + const Offset(6, -4),
+        '${zone.safeVotes}/${zone.unsafeVotes}',
+        colour,
+        9,
+      );
+    }
 
     canvas.drawCircle(centre, 6, Paint()..color = Colors.amber);
 
@@ -164,5 +233,8 @@ class _RadarPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _RadarPainter old) =>
-      old.peers != peers || old.myLat != myLat || old.myLon != myLon;
+      old.peers != peers ||
+      old.zones != zones ||
+      old.myLat != myLat ||
+      old.myLon != myLon;
 }

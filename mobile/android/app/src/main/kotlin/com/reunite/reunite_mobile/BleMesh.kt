@@ -3,7 +3,10 @@ package com.reunite.reunite_mobile
 import android.annotation.SuppressLint
 import android.bluetooth.*
 import android.bluetooth.le.*
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -37,6 +40,8 @@ class BleMesh(
     private val onFrame: (frame: ByteArray, device: String) -> Unit,
     private val onPeerLost: (device: String) -> Unit,
     private val onLog: (String) -> Unit,
+    private val onState: (String) -> Unit = {},
+    private val onRssi: (device: String, rssi: Int) -> Unit = { _, _ -> },
 ) {
     companion object {
         val SERVICE_UUID: UUID = UUID.fromString("a1b2c3d4-e5f6-7890-1234-56789abcdef0")
@@ -69,10 +74,82 @@ class BleMesh(
 
     @Volatile private var running = false
 
+    // ------------------------------------------------------------------- duty cycle
+
+    /** Current scan mode, one of ScanSettings' constants. */
+    private var scanMode = ScanSettings.SCAN_MODE_LOW_LATENCY
+    /** Windowed scanning: listen for [scanWindowMs], then sleep until [scanPeriodMs]. */
+    private var scanWindowMs: Long? = null
+    private var scanPeriodMs: Long? = null
+    private var scanning = false
+    private val dutyRunnable = Runnable { cycleScan() }
+
+    /**
+     * Change how hard the radio listens (phase 2D).
+     *
+     * Scanning is the expensive half of being in a mesh - a receiver listening at full
+     * tilt costs far more than a transmitter speaking occasionally - so this is where
+     * backing off actually buys battery. Android exposes both knobs: the scan mode, and
+     * (by stopping and restarting) a duty cycle.
+     */
+    @SuppressLint("MissingPermission")
+    fun setCadence(scan: String, windowMs: Long?, periodMs: Long?) {
+        val mode = when (scan) {
+            "balanced" -> ScanSettings.SCAN_MODE_BALANCED
+            "low_power" -> ScanSettings.SCAN_MODE_LOW_POWER
+            else -> ScanSettings.SCAN_MODE_LOW_LATENCY
+        }
+        if (mode == scanMode && windowMs == scanWindowMs && periodMs == scanPeriodMs) return
+        scanMode = mode
+        scanWindowMs = windowMs
+        scanPeriodMs = periodMs
+        onLog("scan cadence -> $scan" + if (windowMs != null) " (${windowMs}ms every ${periodMs}ms)" else "")
+        if (!running) return
+        main.removeCallbacks(dutyRunnable)
+        stopScanning()
+        startScanning()
+    }
+
+    /** One step of the windowed scan: flip the scanner and schedule the next flip. */
+    @SuppressLint("MissingPermission")
+    private fun cycleScan() {
+        if (!running) return
+        val window = scanWindowMs
+        val period = scanPeriodMs
+        if (window == null || period == null) return
+        if (scanning) {
+            stopScanning()
+            main.postDelayed(dutyRunnable, (period - window).coerceAtLeast(0))
+        } else {
+            startScanning()
+        }
+    }
+
     fun isSupported(): Boolean =
         adapter != null && context.packageManager.hasSystemFeature("android.hardware.bluetooth_le")
 
     fun isEnabled(): Boolean = adapter?.isEnabled == true
+
+    /** The word Dart uses to decide what, if anything, to tell the user. */
+    fun state(): String = when {
+        adapter == null -> "unsupported"
+        adapter?.isEnabled == true -> "on"
+        else -> "off"
+    }
+
+    /**
+     * The adapter can be switched off while the mesh is running, and the app has to say
+     * so rather than looking as though the mesh simply went quiet. Mirrors the iOS
+     * `centralManagerDidUpdateState` callback, which is push-only by design.
+     */
+    private val adapterWatcher = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == BluetoothAdapter.ACTION_STATE_CHANGED) {
+                onState(state())
+            }
+        }
+    }
+    private var watching = false
 
     /** True once at least one peer can actually receive a frame. */
     fun connectedCount(): Int = (subscribers.keys + clientRx.keys).size
@@ -89,6 +166,14 @@ class BleMesh(
             startGattServer()
             startAdvertising()
             startScanning()
+            if (!watching) {
+                context.registerReceiver(
+                    adapterWatcher,
+                    IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED),
+                )
+                watching = true
+            }
+            onState(state())
             onLog("BLE mesh started; advertising and scanning for $SERVICE_UUID")
             null
         } catch (e: SecurityException) {
@@ -104,13 +189,18 @@ class BleMesh(
     fun stop() {
         if (!running) return
         running = false
+        main.removeCallbacks(dutyRunnable)
         try {
             advertiser?.stopAdvertising(advertiseCallback)
-            scanner?.stopScan(scanCallback)
+            stopScanning()
             clients.values.forEach { runCatching { it.close() } }
             gattServer?.close()
         } catch (e: SecurityException) {
             Log.w(TAG, "permission lost during stop: ${e.message}")
+        }
+        if (watching) {
+            runCatching { context.unregisterReceiver(adapterWatcher) }
+            watching = false
         }
         clients.clear(); clientRx.clear(); subscribers.clear()
         reassemblers.clear(); mtu.clear(); connecting.clear()
@@ -250,14 +340,26 @@ class BleMesh(
         val filters = listOf(
             ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE_UUID)).build()
         )
-        val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-            .build()
+        val settings = ScanSettings.Builder().setScanMode(scanMode).build()
         sc.startScan(filters, settings, scanCallback)
+        scanning = true
+        // If a window is set, schedule the sleep half of the cycle.
+        scanWindowMs?.let { main.postDelayed(dutyRunnable, it) }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun stopScanning() {
+        if (!scanning) return
+        runCatching { scanner?.stopScan(scanCallback) }
+        scanning = false
     }
 
     private val scanCallback = object : ScanCallback() {
+        @SuppressLint("MissingPermission")
         override fun onScanResult(callbackType: Int, result: ScanResult) {
+            // Every advertisement carries a fresh reading, including from devices we
+            // never connect to. It is the only proximity signal BLE gives us.
+            onRssi(result.device.address, result.rssi)
             connectTo(result.device, result.rssi)
         }
         override fun onScanFailed(errorCode: Int) {

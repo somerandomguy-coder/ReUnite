@@ -11,3 +11,12 @@ mobile/ios/Pods/
 # Rust core binaries, produced by scripts/build_ffi.sh
 mobile/android/app/src/main/jniLibs/
 mobile/ios/Frameworks/
+
+# Marketing site: holds the live Google Maps API key. A browser-side key is
+# always visible to whoever loads the page, but it must not be committed to
+# a public repo. Copy web/assets/js/config.example.js to config.js locally.
+web/assets/js/config.js
+# Editor swap files. `.Cargo.toml.swp` was committed once by accident; the pattern is
+# broad so the next one never is.
+*.sw[a-p]
+*~
