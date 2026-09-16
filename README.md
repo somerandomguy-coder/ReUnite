@@ -9,6 +9,7 @@
 In natural disasters—earthquakes, flash floods, hurricanes—communication networks are often the first infrastructure to fail. Cell towers collapse, power lines break, and thousands of survivors are cut off from emergency responders and loved ones.
 
 **ReUnite** solves this critical problem by transforming everyday smartphones into autonomous, peer-to-peer (P2P) relay nodes. Using low-power **Bluetooth Low Energy (BLE)** and local **Wi-Fi radio signals**, devices form a resilient, self-healing mesh network in the air without touching a single server or cell tower.
+
 Devpost: [https://devpost.com/software/reunite-7mcobd](https://devpost.com/software/reunite-7mcobd)
 ---
 
